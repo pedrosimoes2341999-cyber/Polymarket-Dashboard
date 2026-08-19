@@ -1,21 +1,11 @@
-@echo off
-title Polymarket CS2 Combo Tracker AUTO10 v4
-cd /d "%~dp0"
-where node >nul 2>nul
-if errorlevel 1 (
-  echo.
-  echo ERRO: Node.js nao esta instalado.
-  echo Instala Node.js 22 ou superior e volta a executar.
-  echo.
-  pause
-  exit /b
-)
-set APP_USER=admin
-set APP_PASSWORD=admin
-set SESSION_SECRET=local-dev-secret
-set DATA_DIR=%~dp0data
-if not exist "%~dp0data" mkdir "%~dp0data"
-echo A iniciar a app...
-start "" http://localhost:8787
-node --no-warnings server.js
-pause
+{
+  "name": "polymarket-cs2-combo-tracker",
+  "version": "5.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node --no-warnings server.js"
+  }
+}
