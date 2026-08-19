@@ -238,7 +238,29 @@ function isAuthed(req){return verifySession(parseCookies(req).combo_session)}
 function setSessionCookie(res,user){const token=signSession(user,Date.now()+SESSION_TTL_MS);res.setHeader("set-cookie",`combo_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(SESSION_TTL_MS/1000)}`)}
 function clearSessionCookie(res){res.setHeader("set-cookie","combo_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")}
 
-function json(res,s,o){res.writeHead(s,{"content-type":"application/json; charset=utf-8","cache-control":"no-store"});res.end(JSON.stringify(o))}async function body(req){let s="";for await(const c of req)s+=c;return s?JSON.parse(s):{}}const jid=()=>`${Date.now()}_${Math.random().toString(36).slice(2,9)}`;
+function json(res,s,o){
+  res.writeHead(s,{
+    "content-type":"application/json; charset=utf-8",
+    "cache-control":"no-store"
+  });
+  res.end(JSON.stringify(o));
+}
+
+function text(res,status,body,type="text/html; charset=utf-8"){
+  res.writeHead(status,{
+    "content-type":type,
+    "cache-control":"no-store"
+  });
+  res.end(body);
+}
+
+async function body(req){
+  let s="";
+  for await(const c of req)s+=c;
+  return s?JSON.parse(s):{};
+}
+
+const jid=()=>`${Date.now()}_${Math.random().toString(36).slice(2,9)}`;
 const pub=path.join(BASE,"public");
 http.createServer(async(req,res)=>{try{const u=new URL(req.url,`http://${req.headers.host||"localhost"}`);
 if(req.method==="GET"&&u.pathname==="/login")return text(res,200,fs.readFileSync(path.join(pub,"login.html")),"text/html; charset=utf-8");
