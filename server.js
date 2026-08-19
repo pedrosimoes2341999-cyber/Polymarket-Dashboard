@@ -328,15 +328,55 @@ async function eWallet(w,c){
 }
 async function enrichTrackedResult(result){
   if(!result?.combos)return result;
+
   for(const c of result.combos){
-    c.wallet_list=await ePool(c.wallet_list||[],ENRICH_CONCURRENCY,w=>eWallet(w,c));
-    c.open_entry=c.wallet_list.filter(w=>w.status==="Aberta").reduce((a,w)=>a+eNum(w.entry_cost),0);
-    c.current_value=c.wallet_list.reduce((a,w)=>a+eNum(w.current_value),0);
-    c.realized_pnl=c.wallet_list.reduce((a,w)=>a+eNum(w.realized_pnl),0);
-    c.unrealized_pnl=c.wallet_list.reduce((a,w)=>a+eNum(w.unrealized_pnl),0);
-    c.wallet_list.sort((a,b)=>eNum(b.entry_cost)-eNum(a.entry_cost)||eNum(b.activity_amount)-eNum(a.activity_amount))
+    c.wallet_list=await ePool(
+      c.wallet_list||[],
+      ENRICH_CONCURRENCY,
+      async w=>{
+        const x=await eWallet(w,c);
+
+        const confirmedEntry=eNum(x.entry_cost);
+        const activity=eNum(x.activity_amount);
+
+        // "Valor colocado" prioritizes a real reconstructed entry/initial value.
+        // If unavailable, use Activity Amount as a fallback estimate and mark it clearly.
+        if(confirmedEntry>0){
+          x.placed_amount=confirmedEntry;
+          x.placed_source="CONFIRMADO";
+        }else if(activity>0){
+          x.placed_amount=activity;
+          x.placed_source="ESTIMADO_ACTIVITY";
+        }else{
+          x.placed_amount=0;
+          x.placed_source="SEM_DADOS";
+        }
+
+        return x;
+      }
+    );
+
+    c.total_placed_confirmed=c.wallet_list
+      .filter(w=>w.placed_source==="CONFIRMADO")
+      .reduce((a,w)=>a+eNum(w.placed_amount),0);
+
+    c.total_placed_estimated=c.wallet_list
+      .filter(w=>w.placed_source==="ESTIMADO_ACTIVITY")
+      .reduce((a,w)=>a+eNum(w.placed_amount),0);
+
+    c.total_placed=c.wallet_list.reduce((a,w)=>a+eNum(w.placed_amount),0);
+
+    c.wallets_confirmed=c.wallet_list.filter(w=>w.placed_source==="CONFIRMADO").length;
+    c.wallets_estimated=c.wallet_list.filter(w=>w.placed_source==="ESTIMADO_ACTIVITY").length;
+
+    c.wallet_list.sort((a,b)=>eNum(b.placed_amount)-eNum(a.placed_amount));
   }
-  return result
+
+  result.total_placed=result.combos.reduce((a,c)=>a+eNum(c.total_placed),0);
+  result.total_placed_confirmed=result.combos.reduce((a,c)=>a+eNum(c.total_placed_confirmed),0);
+  result.total_placed_estimated=result.combos.reduce((a,c)=>a+eNum(c.total_placed_estimated),0);
+
+  return result;
 }
 
 function trackedResult(slug,main,target){
@@ -1227,6 +1267,6 @@ dbBytes:(()=>{try{return fs.statSync(DB_PATH).size}catch{return 0}})(),
 auto:autoState
 });
 if(req.method==="GET"&&u.pathname==="/api/dashboard/auto")return json(res,200,{auto:autoState});if(req.method==="POST"&&u.pathname==="/api/track"){const b=await body(req),id=jid();setP(id,{status:"queued",message:"A iniciar..."});trackJob(id,b.input);return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/tracked")return json(res,200,{rows:db.prepare("SELECT slug,title,start_time,last_run_utc FROM tracked_games ORDER BY last_run_utc DESC").all()});if(req.method==="POST"&&u.pathname==="/api/dashboard/refresh"){const id=jid();setP(id,{status:"queued",message:"A iniciar..."});dashboardJob(id,"manual");return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/dashboard")return json(res,200,{rows:dashboardRows()});if(req.method==="GET"&&u.pathname.startsWith("/api/jobs/"))return json(res,200,progress.get(u.pathname.split("/").pop())||{status:"unknown"});let f=u.pathname==="/"?"index.html":u.pathname.replace(/^\/+/,"");const fp=path.join(pub,f);if(!fp.startsWith(pub)||!fs.existsSync(fp))return json(res,404,{error:"not found"});const ext=path.extname(fp),types={".html":"text/html; charset=utf-8",".css":"text/css; charset=utf-8",".js":"text/javascript; charset=utf-8"};res.writeHead(200,{"content-type":types[ext]||"application/octet-stream","cache-control":"no-store"});res.end(fs.readFileSync(fp))}catch(e){json(res,500,{error:String(e.message||e)})}}).listen(PORT,HOST,()=>{
-console.log(`\nCS2 Combo Tracker ONLINE v16 ENRICHED POSITIONS: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos | v9 progress\n`);
+console.log(`\nCS2 Combo Tracker ONLINE v17 TOTAL PLACED: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos | v9 progress\n`);
 startDashboardAuto();
 });

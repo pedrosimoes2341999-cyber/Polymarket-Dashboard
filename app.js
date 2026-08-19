@@ -44,32 +44,95 @@ async function poll(job,box,done){box.classList.remove('hidden');for(;;){const d
 $('#refreshDash').onclick=async()=>{const d=await api('/api/dashboard/refresh',{method:'POST'});poll(d.job,$('#dashProgress'),r=>{renderDashboard(r.rows||[]);renderAuto(r.auto)})};async function loadDashboard(){const d=await api('/api/dashboard');renderDashboard(d.rows||[])}function renderDashboard(rows){$('#dashBody').innerHTML=rows.map(r=>`<tr><td><b>${esc(r.title)}</b><br><small>${esc(r.event_slug||'')}</small></td><td>${esc(r.start_time||'')}</td><td class="num">${fmt(r.combo_count)}</td><td class="num">${fmt(r.wallet_count)}</td><td class="num">${fmt(r.position_count)}</td><td class="num ${Number(r.open_entry)>0?'positive':'zero'}"><b>${money(r.open_entry)}</b></td></tr>`).join('')||'<tr><td colspan="6">Ainda sem dados. Clica em “Atualizar agora”.</td></tr>';status()}
 $('#trackBtn').onclick=async()=>{const input=$('#gameInput').value.trim();if(!input)return;$('#comboResults').innerHTML='';$('#trackMetrics').innerHTML='';const d=await api('/api/track',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({input})});poll(d.job,$('#trackProgress'),renderTrack)};
 function renderTrack(r){
-  const combos=r.combos||[],wallets=new Set(combos.flatMap(c=>(c.wallet_list||[]).map(w=>w.wallet)));
-  const sum=k=>combos.reduce((a,c)=>a+Number(c[k]||0),0);
+  const combos=r.combos||[];
+
+  const byWallet=new Map();
+  for(const c of combos){
+    for(const w of c.wallet_list||[]){
+      const key=w.wallet;
+      if(!byWallet.has(key)){
+        byWallet.set(key,{
+          wallet:key,
+          total:0,
+          confirmed:0,
+          estimated:0,
+          combos:0,
+          sources:new Set()
+        });
+      }
+      const g=byWallet.get(key);
+      g.total+=Number(w.placed_amount||0);
+      if(w.placed_source==="CONFIRMADO")g.confirmed+=Number(w.placed_amount||0);
+      if(w.placed_source==="ESTIMADO_ACTIVITY")g.estimated+=Number(w.placed_amount||0);
+      if(Number(w.placed_amount||0)>0)g.combos+=1;
+      g.sources.add(w.placed_source||"SEM_DADOS");
+    }
+  }
+
+  const wallets=[...byWallet.values()].sort((a,b)=>b.total-a.total);
+  const total=wallets.reduce((a,w)=>a+w.total,0);
+  const confirmed=wallets.reduce((a,w)=>a+w.confirmed,0);
+  const estimated=wallets.reduce((a,w)=>a+w.estimated,0);
+
   $('#trackMetrics').innerHTML=
-    `<div class="metric"><span>Combos acumuladas</span><b>${fmt(combos.length)}</b></div>`+
-    `<div class="metric"><span>Novas nesta execução</span><b>${fmt(r.newCombos||0)}</b></div>`+
-    `<div class="metric"><span>Wallets</span><b>${fmt(wallets.size)}</b></div>`+
-    `<div class="metric"><span>Entry Cost aberto</span><b>${money(sum('open_entry'))}</b></div>`+
-    `<div class="metric"><span>Activity Amount</span><b>${money(sum('activity_amount'))}</b></div>`+
-    `<div class="metric"><span>Current Value</span><b>${money(sum('current_value'))}</b></div>`+
-    `<div class="metric"><span>Realized PnL</span><b>${money(sum('realized_pnl'))}</b></div>`+
-    `<div class="metric"><span>Unrealized PnL</span><b>${money(sum('unrealized_pnl'))}</b></div>`+
+    `<div class="metric"><span>Total colocado neste jogo</span><b>${money(total)}</b></div>`+
+    `<div class="metric"><span>Confirmado</span><b>${money(confirmed)}</b></div>`+
+    `<div class="metric"><span>Estimado via Activity</span><b>${money(estimated)}</b></div>`+
+    `<div class="metric"><span>Wallets</span><b>${fmt(wallets.length)}</b></div>`+
+    `<div class="metric"><span>Combos</span><b>${fmt(combos.length)}</b></div>`+
     `<div class="metric"><span>Execução</span><b style="font-size:14px">${r.incremental?'Incremental':'Primeira indexação'}</b></div>`;
-  const show=(ok,v,type='money')=>ok?(type==='num'?fmt(v):money(v)):'—';
-  $('#comboResults').innerHTML=combos.map((c,i)=>{
-    const target=(c.legs||[]).filter(l=>(r.event?.markets||[]).some(m=>String(m.conditionId||m.condition_id||'').toLowerCase()===String(l.condition_id||'').toLowerCase()));
-    const other=(c.legs||[]).filter(l=>!target.includes(l));
-    return `<div class="combo"><div class="combohead"><b>#${i+1}</b><code>${esc(c.combo_id)}</code><b class="positive">${money(c.open_entry||0)} aberto</b><span>${fmt(c.wallets)} wallets</span><span>${money(c.activity_amount||0)} activity</span></div>
-    <div class="combo-grid"><div class="combo-section"><h3>Seleção no jogo</h3>${target.map(l=>`<div class="pick targetpick">🎯 <b>${esc(l.outcome)}</b> — ${esc(l.market_title||l.event_title)}</div>`).join('')}</div>
-    <div class="combo-section"><h3>Restantes legs</h3>${other.map(l=>`<div class="pick">• <b>${esc(l.outcome)}</b> — ${esc(l.event_title)} · ${esc(l.market_title)}</div>`).join('')||'<div class="pick muted">Sem outras legs</div>'}</div></div>
-    <div class="position-table-wrap"><table class="position-table"><thead><tr><th>Wallet</th><th>Fonte</th><th>Estado</th><th>Entry / Initial</th><th>Activity Amount</th><th>Total Bought</th><th>Avg Price</th><th>Current Value</th><th>Shares</th><th>Realized PnL</th><th>Unrealized PnL</th><th>Payout</th><th>1.ª entrada/activity</th></tr></thead><tbody>
-    ${(c.wallet_list||[]).map(w=>{const ok=!!w.enriched,state=w.status==='Aberta'?'<span class="open">Aberta</span>':w.status==='Fechada'?'<span class="closed">Fechada</span>':'<span class="closed">Só Activity</span>';
-      return `<tr><td><code class="walletcode">${esc(w.wallet)}</code></td><td><code>${esc(w.data_source||w.source||'ACTIVITY')}</code></td><td>${state}</td>
-      <td class="num"><b>${show(ok,w.entry_cost)}</b></td><td class="num positive"><b>${money(w.activity_amount||0)}</b></td><td class="num">${show(ok,w.total_bought)}</td>
-      <td class="num">${ok?Number(w.avg_price||0).toFixed(4):'—'}</td><td class="num">${show(ok,w.current_value)}</td><td class="num">${show(ok,w.shares,'num')}</td>
-      <td class="num">${show(ok,w.realized_pnl)}</td><td class="num">${show(ok,w.unrealized_pnl)}</td><td class="num">${money(w.activity_payout||0)}</td><td>${esc(w.first_entry_at||w.first_activity_at||'')}</td></tr>`}).join('')}
-    </tbody></table></div></div>`}).join('')||'<div class="card">Nenhuma combo encontrada na cobertura indexada.</div>';
+
+  const comboBlocks=combos.map((c,i)=>`
+    <div class="combo">
+      <div class="combohead">
+        <b>#${i+1}</b>
+        <code>${esc(c.combo_id)}</code>
+        <b class="positive">${money(c.total_placed||0)}</b>
+        <span>${fmt((c.wallet_list||[]).length)} wallets</span>
+        <span>${fmt(c.wallets_confirmed||0)} confirmadas</span>
+        <span>${fmt(c.wallets_estimated||0)} estimadas</span>
+      </div>
+    </div>`).join('');
+
+  const rows=wallets.map((w,i)=>{
+    let quality="Sem dados";
+    if(w.confirmed>0 && w.estimated>0)quality="Misto";
+    else if(w.confirmed>0)quality="Confirmado";
+    else if(w.estimated>0)quality="Estimado via Activity";
+
+    return `<tr>
+      <td>${i+1}</td>
+      <td><code class="walletcode">${esc(w.wallet)}</code></td>
+      <td class="num positive"><b>${money(w.total)}</b></td>
+      <td class="num">${money(w.confirmed)}</td>
+      <td class="num">${money(w.estimated)}</td>
+      <td class="num">${fmt(w.combos)}</td>
+      <td>${esc(quality)}</td>
+    </tr>`;
+  }).join('');
+
+  $('#comboResults').innerHTML=`
+    <div class="card" style="margin-bottom:14px">
+      <h3 style="margin-top:0">Valor colocado por wallet</h3>
+      <div class="position-table-wrap">
+        <table class="position-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Wallet</th>
+              <th>Total colocado</th>
+              <th>Confirmado</th>
+              <th>Estimado via Activity</th>
+              <th>N.º Combos</th>
+              <th>Qualidade</th>
+            </tr>
+          </thead>
+          <tbody>${rows||'<tr><td colspan="7">Sem dados.</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
+    ${comboBlocks}`;
+
   status();
 }
 loadDashboard();

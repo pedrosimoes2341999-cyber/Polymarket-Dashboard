@@ -1,0 +1,15 @@
+v17 TOTAL PLACED
+
+Objetivo:
+- Mostrar no topo o valor total colocado nas combos associadas ao jogo.
+- Mostrar por wallet quanto foi colocado.
+- Simplificar o ecrã de Tracking.
+
+Regra:
+1) Se existir Entry/Initial reconstruído -> usa como CONFIRMADO.
+2) Se não existir Entry/Initial, mas existir Activity Amount -> usa como ESTIMATIVA e marca "Estimado via Activity".
+3) Se não existir nenhum dos dois -> 0 / sem dados.
+
+IMPORTANTE:
+Activity Amount não é matematicamente equivalente a Entry Cost, por isso é mostrado separadamente e marcado como estimativa.
+Não apagar /data nem fazer Wipe Volume.
