@@ -64,6 +64,19 @@ const q={
 };
 const progress=new Map();let rpcIdx=0;
 const now=()=>new Date().toISOString(),sleep=ms=>new Promise(r=>setTimeout(r,ms)),num=v=>Number.isFinite(Number(v))?Number(v):0;
+
+async function withTimeout(promise,ms,label="operation"){
+  let timer;
+  try{
+    return await Promise.race([
+      promise,
+      new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error(`${label} timeout after ${ms}ms`)),ms)})
+    ]);
+  }finally{
+    clearTimeout(timer);
+  }
+}
+
 function setP(id,x){progress.set(id,{...x,updated:now()})}function slugOf(x){x=String(x||"").trim();if(/^https?:\/\//i.test(x)){const u=new URL(x);return u.pathname.replace(/\/+$/,"").split("/").pop()}return x.replace(/\/+$/,"").split("/").pop()}
 async function fetchJ(url,opt={},retries=4){let last;for(let i=0;i<retries;i++){try{const c=new AbortController(),t=setTimeout(()=>c.abort(),opt.timeout||15000);const r=await fetch(url,{...opt,signal:c.signal,headers:{Accept:"application/json",...(opt.headers||{})}});clearTimeout(t);if(r.status===429||r.status>=500){await sleep(Math.min(500*2**i,5000));continue}if(!r.ok)throw Error(`${r.status} ${r.statusText}`);return await r.json()}catch(e){last=e;await sleep(Math.min(400*2**i,4000))}}throw last||Error("request failed")}
 async function rpc(method,params){let last;for(let a=0;a<5;a++){for(let j=0;j<RPCS.length;j++){const idx=(rpcIdx+j)%RPCS.length;try{const d=await fetchJ(RPCS[idx],{method:"POST",timeout:15000,headers:{"content-type":"application/json"},body:JSON.stringify({jsonrpc:"2.0",id:1,method,params})},1);if(d.error)throw Error(JSON.stringify(d.error));rpcIdx=idx;return d.result}catch(e){last=e}}await sleep(500*(a+1))}throw last}
@@ -271,7 +284,68 @@ async function activeCS2(){
   return [...found.values()];
 }
 
-async function refreshActive(){const events=await activeCS2(),ts=now();db.exec("DELETE FROM active_games;DELETE FROM active_game_markets;");for(const e0 of events){let e=e0;if(!e.markets){try{e=await eventBySlug(e.slug)}catch{}}const key=String(e.id?`event:${e.id}`:`slug:${e.slug}`);db.prepare("INSERT OR REPLACE INTO active_games(game_key,event_id,event_slug,title,start_time,refreshed_at) VALUES(?,?,?,?,?,?)").run(key,String(e.id||""),String(e.slug||""),String(e.title||""),String(e.startDate||e.endDate||""),ts);for(const m of marketRows([e]))db.prepare("INSERT OR REPLACE INTO active_game_markets(game_key,condition_id,market_slug,market_title) VALUES(?,?,?,?)").run(key,m.condition_id,m.market_slug,m.market_title)}return events.length}
+async function refreshActive(progressCb){
+  const events=await activeCS2();
+  const ts=now();
+
+  db.exec("DELETE FROM active_games;DELETE FROM active_game_markets;");
+
+  let done=0,marketCount=0,failed=0;
+  const queue=[...events];
+  const concurrency=Math.min(6,Math.max(1,events.length));
+
+  console.log(`CS2 refreshActive: ${events.length} eventos | concorrência ${concurrency}`);
+
+  async function worker(){
+    while(queue.length){
+      const e0=queue.shift();
+      let e=e0;
+
+      try{
+        if(!e.markets){
+          e=await withTimeout(
+            eventBySlug(e.slug),
+            8000,
+            `event ${e.slug}`
+          );
+        }
+
+        const key=String(e.id?`event:${e.id}`:`slug:${e.slug}`);
+        db.prepare("INSERT OR REPLACE INTO active_games(game_key,event_id,event_slug,title,start_time,refreshed_at) VALUES(?,?,?,?,?,?)")
+          .run(
+            key,
+            String(e.id||""),
+            String(e.slug||""),
+            String(e.title||""),
+            String(e.startDate||e.endDate||""),
+            ts
+          );
+
+        const rows=marketRows([e]);
+        marketCount+=rows.length;
+
+        for(const m of rows){
+          db.prepare("INSERT OR REPLACE INTO active_game_markets(game_key,condition_id,market_slug,market_title) VALUES(?,?,?,?)")
+            .run(key,m.condition_id,m.market_slug,m.market_title);
+        }
+      }catch(err){
+        failed++;
+        console.log(`CS2 evento falhou: ${String(e0.slug||e0.id||"?")} | ${String(err.message||err)}`);
+      }finally{
+        done++;
+        const msg=`CS2 jogos ${done}/${events.length} | mercados ${marketCount} | falhas ${failed}`;
+        console.log(msg);
+        if(progressCb)progressCb({done,total:events.length,markets:marketCount,failed,message:msg});
+        await new Promise(r=>setImmediate(r));
+      }
+    }
+  }
+
+  await Promise.all(Array.from({length:concurrency},()=>worker()));
+
+  console.log(`CS2 refreshActive concluído: ${events.length} eventos | ${marketCount} mercados | ${failed} falhas`);
+  return {events:events.length,markets:marketCount,failed};
+}
 
 function cleanupDatabase(){
   try{
@@ -338,6 +412,8 @@ function cleanupDatabase(){
 
 function dashboardRows(){return db.prepare(`WITH linked AS(SELECT ag.game_key,ag.event_slug,ag.title,ag.start_time,cl.combo_id FROM active_games ag JOIN active_game_markets gm ON gm.game_key=ag.game_key JOIN combo_legs cl ON cl.condition_id=gm.condition_id GROUP BY ag.game_key,cl.combo_id),agg AS(SELECT l.game_key,l.event_slug,l.title,l.start_time,COUNT(DISTINCT l.combo_id) combo_count,COUNT(DISTINCT p.wallet) wallet_count,COUNT(p.position_id) position_count,SUM(CASE WHEN (p.resolved_at IS NULL OR p.resolved_at='') AND p.shares>0.0001 THEN p.entry_cost ELSE 0 END) open_entry FROM linked l LEFT JOIN combo_positions p ON p.combo_id=l.combo_id GROUP BY l.game_key) SELECT * FROM agg ORDER BY open_entry DESC,combo_count DESC`).all()}
 async function dashboardJob(id,source="manual"){
+  const hardDeadline=Date.now()+8*60*1000;
+  const checkDeadline=()=>{if(Date.now()>hardDeadline)throw new Error("Dashboard excedeu o limite de 8 minutos.");};
   if(dashboardRunning){
     setP(id,{status:"done",message:"Já existe uma atualização do Dashboard em curso.",result:{rows:dashboardRows(),auto:autoState}});
     return;
@@ -353,9 +429,18 @@ async function dashboardJob(id,source="manual"){
 
   try{
     setP(id,{status:"running",message:source==="auto"?"Auto-refresh: a atualizar jogos CS2 ativos...":"A atualizar jogos CS2 ativos..."});
-    await refreshActive();
+    const activeInfo=await refreshActive(p=>{
+      setP(id,{
+        status:"running",
+        message:`Jogos CS2 ${p.done}/${p.total} · ${p.markets} mercados · ${p.failed} falhas`
+      });
+    });
     cleanupDatabase();
+    if(!activeInfo.markets){
+      throw new Error(`Foram encontrados ${activeInfo.events} eventos CS2, mas 0 mercados foram extraídos.`);
+    }
 
+    checkDeadline();
     const hi=await latest();
     let lo=Number(q.getMeta.get("dashboard_last_block")?.value||0);
 
@@ -366,6 +451,7 @@ async function dashboardJob(id,source="manual"){
     }
 
     setP(id,{status:"running",message:"A procurar novas wallets Combo..."});
+    checkDeadline();
     const sc=await scanLogs(
       lo,
       hi,
@@ -380,6 +466,7 @@ async function dashboardJob(id,source="manual"){
 
     setP(id,{status:"running",message:`A atualizar ${wallets.length} wallets (novas + relevantes)...`});
 
+    checkDeadline();
     await mapPool(
       wallets,
       DASHBOARD_POSITION_CONCURRENCY,
@@ -501,6 +588,6 @@ dbBytes:(()=>{try{return fs.statSync(DB_PATH).size}catch{return 0}})(),
 auto:autoState
 });
 if(req.method==="GET"&&u.pathname==="/api/dashboard/auto")return json(res,200,{auto:autoState});if(req.method==="POST"&&u.pathname==="/api/track"){const b=await body(req),id=jid();setP(id,{status:"queued",message:"A iniciar..."});trackJob(id,b.input);return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/tracked")return json(res,200,{rows:db.prepare("SELECT slug,title,start_time,last_run_utc FROM tracked_games ORDER BY last_run_utc DESC").all()});if(req.method==="POST"&&u.pathname==="/api/dashboard/refresh"){const id=jid();setP(id,{status:"queued",message:"A iniciar..."});dashboardJob(id,"manual");return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/dashboard")return json(res,200,{rows:dashboardRows()});if(req.method==="GET"&&u.pathname.startsWith("/api/jobs/"))return json(res,200,progress.get(u.pathname.split("/").pop())||{status:"unknown"});let f=u.pathname==="/"?"index.html":u.pathname.replace(/^\/+/,"");const fp=path.join(pub,f);if(!fp.startsWith(pub)||!fs.existsSync(fp))return json(res,404,{error:"not found"});const ext=path.extname(fp),types={".html":"text/html; charset=utf-8",".css":"text/css; charset=utf-8",".js":"text/javascript; charset=utf-8"};res.writeHead(200,{"content-type":types[ext]||"application/octet-stream","cache-control":"no-store"});res.end(fs.readFileSync(fp))}catch(e){json(res,500,{error:String(e.message||e)})}}).listen(PORT,HOST,()=>{
-console.log(`\nCS2 Combo Tracker ONLINE v8 CS2 DISCOVERY: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos\n`);
+console.log(`\nCS2 Combo Tracker ONLINE v9 PROGRESS: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos | v9 progress\n`);
 startDashboardAuto();
 });
