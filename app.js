@@ -46,74 +46,189 @@ $('#trackBtn').onclick=async()=>{const input=$('#gameInput').value.trim();if(!in
 function renderTrack(r){
   const combos=r.combos||[];
 
-  const byWallet=new Map();
+  function legLabel(l){
+    const outcome=String(l?.outcome||'').trim();
+    const market=String(l?.market_title||'').trim();
+    const event=String(l?.event_title||'').trim();
+    const parts=[];
+    if(outcome)parts.push(outcome);
+    if(market && !parts.includes(market))parts.push(market);
+    if(event && !parts.includes(event))parts.push(event);
+    return parts.join(' — ')||'Leg sem descrição';
+  }
+
+  function isTargetLeg(l){
+    return (r.event?.markets||[]).some(m=>
+      String(m.conditionId||m.condition_id||'').toLowerCase()===
+      String(l?.condition_id||'').toLowerCase()
+    );
+  }
+
+  // -------- GLOBAL TOTALS --------
+  const allRows=[];
   for(const c of combos){
+    const targetLegs=(c.legs||[]).filter(isTargetLeg);
+    const otherLegs=(c.legs||[]).filter(l=>!targetLegs.includes(l));
+
     for(const w of c.wallet_list||[]){
-      const key=w.wallet;
-      if(!byWallet.has(key)){
-        byWallet.set(key,{
-          wallet:key,
-          total:0,
-          confirmed:0,
-          estimated:0,
-          combos:0,
-          sources:new Set()
-        });
-      }
-      const g=byWallet.get(key);
-      g.total+=Number(w.placed_amount||0);
-      if(w.placed_source==="CONFIRMADO")g.confirmed+=Number(w.placed_amount||0);
-      if(w.placed_source==="ESTIMADO_ACTIVITY")g.estimated+=Number(w.placed_amount||0);
-      if(Number(w.placed_amount||0)>0)g.combos+=1;
-      g.sources.add(w.placed_source||"SEM_DADOS");
+      allRows.push({
+        combo_id:c.combo_id,
+        wallet:w.wallet,
+        placed:Number(w.placed_amount||0),
+        confirmed:w.placed_source==="CONFIRMADO"?Number(w.placed_amount||0):0,
+        estimated:w.placed_source==="ESTIMADO_ACTIVITY"?Number(w.placed_amount||0):0,
+        source:w.placed_source||"SEM_DADOS",
+        targetLegs,
+        otherLegs
+      });
     }
   }
 
-  const wallets=[...byWallet.values()].sort((a,b)=>b.total-a.total);
-  const total=wallets.reduce((a,w)=>a+w.total,0);
-  const confirmed=wallets.reduce((a,w)=>a+w.confirmed,0);
-  const estimated=wallets.reduce((a,w)=>a+w.estimated,0);
+  const total=allRows.reduce((a,x)=>a+x.placed,0);
+  const confirmed=allRows.reduce((a,x)=>a+x.confirmed,0);
+  const estimated=allRows.reduce((a,x)=>a+x.estimated,0);
+  const wallets=new Set(allRows.map(x=>x.wallet));
 
   $('#trackMetrics').innerHTML=
     `<div class="metric"><span>Total colocado neste jogo</span><b>${money(total)}</b></div>`+
     `<div class="metric"><span>Confirmado</span><b>${money(confirmed)}</b></div>`+
     `<div class="metric"><span>Estimado via Activity</span><b>${money(estimated)}</b></div>`+
-    `<div class="metric"><span>Wallets</span><b>${fmt(wallets.length)}</b></div>`+
+    `<div class="metric"><span>Wallets</span><b>${fmt(wallets.size)}</b></div>`+
     `<div class="metric"><span>Combos</span><b>${fmt(combos.length)}</b></div>`+
     `<div class="metric"><span>Execução</span><b style="font-size:14px">${r.incremental?'Incremental':'Primeira indexação'}</b></div>`;
 
-  const comboBlocks=combos.map((c,i)=>`
-    <div class="combo">
+  // -------- GROUP BY TARGET LEG --------
+  const legGroups=new Map();
+
+  for(const row of allRows){
+    const targets=row.targetLegs.length?row.targetLegs:[null];
+
+    for(const leg of targets){
+      const key=leg
+        ? `${String(leg.condition_id||'').toLowerCase()}|${String(leg.outcome||'').toLowerCase()}`
+        : 'SEM_LEG';
+
+      if(!legGroups.has(key)){
+        legGroups.set(key,{
+          label:leg?legLabel(leg):'Leg do jogo não identificada',
+          total:0,
+          confirmed:0,
+          estimated:0,
+          wallets:new Set(),
+          combos:new Set(),
+          rows:[]
+        });
+      }
+
+      const g=legGroups.get(key);
+      g.total+=row.placed;
+      g.confirmed+=row.confirmed;
+      g.estimated+=row.estimated;
+      g.wallets.add(row.wallet);
+      g.combos.add(row.combo_id);
+      g.rows.push({...row,targetLeg:leg});
+    }
+  }
+
+  const groups=[...legGroups.values()].sort((a,b)=>b.total-a.total);
+
+  const groupCards=groups.map((g,gi)=>{
+    const detailRows=g.rows
+      .slice()
+      .sort((a,b)=>b.placed-a.placed)
+      .map((x,i)=>{
+        const others=x.otherLegs.length
+          ? x.otherLegs.map(l=>`<div class="pick">• ${esc(legLabel(l))}</div>`).join('')
+          : '<span class="muted">Sem outras legs</span>';
+
+        const quality=x.source==="CONFIRMADO"
+          ? '<span class="open">Confirmado</span>'
+          : x.source==="ESTIMADO_ACTIVITY"
+            ? '<span class="closed">Estimado via Activity</span>'
+            : '<span class="muted">Sem dados</span>';
+
+        return `<tr>
+          <td>${i+1}</td>
+          <td><code class="walletcode">${esc(x.wallet)}</code></td>
+          <td class="num positive"><b>${money(x.placed)}</b></td>
+          <td>${quality}</td>
+          <td><code>${esc(x.combo_id)}</code></td>
+          <td>${others}</td>
+        </tr>`;
+      }).join('');
+
+    return `<div class="combo" style="margin-bottom:16px">
       <div class="combohead">
-        <b>#${i+1}</b>
-        <code>${esc(c.combo_id)}</code>
-        <b class="positive">${money(c.total_placed||0)}</b>
-        <span>${fmt((c.wallet_list||[]).length)} wallets</span>
-        <span>${fmt(c.wallets_confirmed||0)} confirmadas</span>
-        <span>${fmt(c.wallets_estimated||0)} estimadas</span>
+        <b>#${gi+1}</b>
+        <span style="flex:1"><b>${esc(g.label)}</b></span>
+        <b class="positive">${money(g.total)}</b>
+        <span>${fmt(g.wallets.size)} wallets</span>
+        <span>${fmt(g.combos.size)} combos</span>
       </div>
-    </div>`).join('');
 
-  const rows=wallets.map((w,i)=>{
-    let quality="Sem dados";
-    if(w.confirmed>0 && w.estimated>0)quality="Misto";
-    else if(w.confirmed>0)quality="Confirmado";
-    else if(w.estimated>0)quality="Estimado via Activity";
+      <div class="combo-grid">
+        <div class="combo-section">
+          <h3>Resumo da leg</h3>
+          <div class="pick targetpick">🎯 <b>${esc(g.label)}</b></div>
+        </div>
+        <div class="combo-section">
+          <h3>Valor colocado</h3>
+          <div class="pick">Total: <b>${money(g.total)}</b></div>
+          <div class="pick">Confirmado: <b>${money(g.confirmed)}</b></div>
+          <div class="pick">Estimado via Activity: <b>${money(g.estimated)}</b></div>
+        </div>
+      </div>
 
-    return `<tr>
+      <div class="position-table-wrap">
+        <table class="position-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Wallet</th>
+              <th>Valor colocado</th>
+              <th>Qualidade</th>
+              <th>Combo ID</th>
+              <th>Restantes legs da combo</th>
+            </tr>
+          </thead>
+          <tbody>${detailRows||'<tr><td colspan="6">Sem detalhe.</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>`;
+  }).join('');
+
+  // -------- WALLET TOTAL ACROSS ALL TARGET LEGS --------
+  const walletMap=new Map();
+  for(const x of allRows){
+    if(!walletMap.has(x.wallet)){
+      walletMap.set(x.wallet,{
+        wallet:x.wallet,total:0,confirmed:0,estimated:0,
+        combos:new Set(),legs:new Set()
+      });
+    }
+    const w=walletMap.get(x.wallet);
+    w.total+=x.placed;
+    w.confirmed+=x.confirmed;
+    w.estimated+=x.estimated;
+    w.combos.add(x.combo_id);
+    for(const l of x.targetLegs)w.legs.add(legLabel(l));
+  }
+
+  const walletRows=[...walletMap.values()]
+    .sort((a,b)=>b.total-a.total)
+    .map((w,i)=>`<tr>
       <td>${i+1}</td>
       <td><code class="walletcode">${esc(w.wallet)}</code></td>
       <td class="num positive"><b>${money(w.total)}</b></td>
       <td class="num">${money(w.confirmed)}</td>
       <td class="num">${money(w.estimated)}</td>
-      <td class="num">${fmt(w.combos)}</td>
-      <td>${esc(quality)}</td>
-    </tr>`;
-  }).join('');
+      <td>${[...w.legs].map(x=>`<div class="pick">🎯 ${esc(x)}</div>`).join('')}</td>
+      <td class="num">${fmt(w.combos.size)}</td>
+    </tr>`).join('');
 
   $('#comboResults').innerHTML=`
-    <div class="card" style="margin-bottom:14px">
-      <h3 style="margin-top:0">Valor colocado por wallet</h3>
+    <div class="card" style="margin-bottom:18px">
+      <h3 style="margin-top:0">Resumo por wallet</h3>
       <div class="position-table-wrap">
         <table class="position-table">
           <thead>
@@ -123,15 +238,23 @@ function renderTrack(r){
               <th>Total colocado</th>
               <th>Confirmado</th>
               <th>Estimado via Activity</th>
+              <th>Leg(s) do jogo</th>
               <th>N.º Combos</th>
-              <th>Qualidade</th>
             </tr>
           </thead>
-          <tbody>${rows||'<tr><td colspan="7">Sem dados.</td></tr>'}</tbody>
+          <tbody>${walletRows||'<tr><td colspan="7">Sem dados.</td></tr>'}</tbody>
         </table>
       </div>
     </div>
-    ${comboBlocks}`;
+
+    <div style="margin:18px 0 10px">
+      <h2 style="margin:0">Detalhe agrupado por leg colocada</h2>
+      <p class="muted" style="margin-top:6px">
+        O valor pertence à combo inteira; a leg abaixo indica a seleção deste jogo presente nessa combo.
+      </p>
+    </div>
+
+    ${groupCards||'<div class="card">Nenhuma leg encontrada.</div>'}`;
 
   status();
 }

@@ -1,0 +1,20 @@
+v18 - AGRUPAMENTO POR LEG
+
+Tracking:
+1. Total colocado no jogo.
+2. Resumo global por wallet.
+3. Agrupamento por leg/seleção do jogo alvo.
+4. Dentro de cada leg:
+   - total colocado;
+   - confirmado;
+   - estimado via Activity;
+   - wallets;
+   - combos;
+   - restantes legs de cada combo.
+
+Nota:
+O dinheiro é colocado na COMBO, não individualmente em cada leg.
+O agrupamento por leg mostra quanto dinheiro esteve em combos que continham aquela seleção do jogo alvo.
+
+Substituir server.js e app.js.
+Não fazer Wipe Volume.
