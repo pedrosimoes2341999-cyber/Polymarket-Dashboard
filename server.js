@@ -19,9 +19,11 @@ const CONTRACTS=[
 "0x200000900045e3B6259600682756002200028933","0x30000034706C7d8e12009DAB006Be20000c031A8",
 "0xe3333700cA9d93003F00f0F71f8515005F6c00Aa","0xa1200000d0002264C9a1698e001292D00E1b00af"].map(x=>x.toLowerCase());
 const IGNORE=new Set([...CONTRACTS,"0x0000000000000000000000000000000000000000"]);
-const LOG_CHUNK=2000,TOPIC_FALLBACK_MIN=25,TX_FALLBACK_MAX=1000;
-const TRACK_ACTIVITY_CONCURRENCY=4,TRACK_POSITION_CONCURRENCY=4,DASHBOARD_POSITION_CONCURRENCY=6;
-const MAX_COMBO_PAGES_PER_WALLET=20;
+const LOG_CHUNK=3500,TOPIC_FALLBACK_MIN=25,TX_FALLBACK_MAX=3000;
+const TRACK_ACTIVITY_CONCURRENCY=10,TRACK_POSITION_CONCURRENCY=10,DASHBOARD_ACTIVITY_CONCURRENCY=10,DASHBOARD_POSITION_CONCURRENCY=10;
+const MAX_COMBO_PAGES_PER_WALLET=100;
+const MAX_INITIAL_SCAN_DAYS=30;
+const PRE_EVENT_MARGIN_HOURS=4;
 
 // Dashboard automático: 10 minutos.
 const DASHBOARD_AUTO_MS=10*60*1000;
@@ -128,120 +130,6 @@ async function activity(w){
   await comboPages("activity",w,rows=>{out.push(...rows)});
   return out;
 }
-
-async function marketPositionWallets(conditionIds,status="OPEN",progressCb){
-  const ids=[...new Set((conditionIds||[]).map(x=>String(x||"").toLowerCase()).filter(x=>/^0x[a-f0-9]{64}$/.test(x)))];
-  const wallets=new Set();
-  let done=0,positionsSeen=0,failed=0;
-  const queue=[...ids];
-  const concurrency=Math.min(8,Math.max(1,ids.length));
-
-  async function oneMarket(cid){
-    // offset is per outcome token. Page until every token returns fewer than the page size.
-    const PAGE=500;
-    for(let offset=0;offset<=10000;offset+=PAGE){
-      const u=new URL(`${DATA}/v1/market-positions`);
-      u.searchParams.set("market",cid);
-      u.searchParams.set("status",status);
-      u.searchParams.set("sortBy","TOKENS");
-      u.searchParams.set("sortDirection","DESC");
-      u.searchParams.set("limit",String(PAGE));
-      u.searchParams.set("offset",String(offset));
-
-      let groups;
-      try{
-        groups=await fetchJ(u.toString(),{timeout:12000},3);
-      }catch(e){
-        failed++;
-        console.log(`Market positions falhou ${cid.slice(0,10)}…: ${String(e.message||e)}`);
-        break;
-      }
-
-      if(!Array.isArray(groups)||!groups.length)break;
-
-      let maxLen=0;
-      for(const g of groups){
-        const ps=Array.isArray(g?.positions)?g.positions:[];
-        maxLen=Math.max(maxLen,ps.length);
-        positionsSeen+=ps.length;
-        for(const p of ps){
-          const w=String(p?.proxyWallet||"").toLowerCase();
-          if(/^0x[a-f0-9]{40}$/.test(w)){
-            wallets.add(w);
-            q.wallet.run(w,now(),now());
-          }
-        }
-      }
-
-      if(maxLen<PAGE)break;
-      await new Promise(r=>setImmediate(r));
-    }
-  }
-
-  async function worker(){
-    while(queue.length){
-      const cid=queue.shift();
-      await oneMarket(cid);
-      done++;
-      if(progressCb){
-        progressCb({
-          done,
-          total:ids.length,
-          wallets:wallets.size,
-          positions:positionsSeen,
-          failed
-        });
-      }
-      await new Promise(r=>setImmediate(r));
-    }
-  }
-
-  await Promise.all(Array.from({length:concurrency},()=>worker()));
-  return {wallets:[...wallets],positions:positionsSeen,failed,markets:ids.length};
-}
-
-async function marketTradeWallets(conditionIds,progressCb){
-  // Fallback/coverage extension: market-scoped trades return proxyWallet directly.
-  // This is deliberately bounded to avoid an unbounded historical crawl.
-  const ids=[...new Set((conditionIds||[]).map(x=>String(x||"").toLowerCase()).filter(x=>/^0x[a-f0-9]{64}$/.test(x)))];
-  const wallets=new Set();
-  let done=0,tradesSeen=0,failed=0;
-  const queue=[...ids];
-  const concurrency=Math.min(5,Math.max(1,ids.length));
-
-  async function worker(){
-    while(queue.length){
-      const cid=queue.shift();
-      try{
-        const u=new URL(`${DATA}/trades`);
-        u.searchParams.set("market",cid);
-        u.searchParams.set("limit","10000");
-        u.searchParams.set("offset","0");
-        u.searchParams.set("takerOnly","false");
-        const rows=await fetchJ(u.toString(),{timeout:12000},2);
-        if(Array.isArray(rows)){
-          tradesSeen+=rows.length;
-          for(const p of rows){
-            const w=String(p?.proxyWallet||"").toLowerCase();
-            if(/^0x[a-f0-9]{40}$/.test(w)){
-              wallets.add(w);
-              q.wallet.run(w,now(),now());
-            }
-          }
-        }
-      }catch(e){
-        failed++;
-      }
-      done++;
-      if(progressCb)progressCb({done,total:ids.length,wallets:wallets.size,trades:tradesSeen,failed});
-      await new Promise(r=>setImmediate(r));
-    }
-  }
-
-  await Promise.all(Array.from({length:concurrency},()=>worker()));
-  return {wallets:[...wallets],trades:tradesSeen,failed,markets:ids.length};
-}
-
 function legCid(l){return String(l.leg_condition_id||"").toLowerCase()}function legLabel(l){const m=l.market||{},e=m.event||{};return{condition_id:legCid(l),event_slug:String(e.event_slug||""),event_title:String(e.event_title||""),market_slug:String(m.slug||""),market_title:String(m.title||""),outcome:String(l.leg_outcome_label||m.outcome||"")}}
 function saveLegs(cid,legs){let i=0;for(const l of legs||[]){i++;const x=legLabel(l);if(!x.condition_id)continue;q.leg.run(cid,Number(l.leg_index||i),x.condition_id,x.event_slug,x.event_title,x.market_slug,x.market_title,x.outcome)}}
 function comboMatch(c,target){return(c.legs||[]).some(l=>target.has(legCid(l)))}
@@ -261,6 +149,74 @@ async function refreshActivityWallet(w,target,slug){
   });
   return matches;
 }
+
+async function refreshActivityWalletDashboard(w,target){
+  const rows=await activity(w);
+  let matches=0;
+
+  for(const a of rows){
+    if(!comboMatch(a,target))continue;
+
+    matches++;
+    const cid=String(a.combo_condition_id||"");
+    if(!cid)continue;
+
+    q.act.run(
+      w,
+      cid,
+      String(a.combo_position_id||""),
+      String(a.tx_hash||""),
+      String(a.log_index??""),
+      String(a.event_kind||""),
+      String(a.module_kind||""),
+      num(a.amount_usdc),
+      num(a.payout_usdc),
+      String(a.tx_dttm||a.timestamp||""),
+      now()
+    );
+
+    saveLegs(cid,a.legs||[]);
+
+    db.prepare(
+      "INSERT OR REPLACE INTO dashboard_match_wallets(wallet,last_match_utc) VALUES(?,?)"
+    ).run(w,now());
+  }
+
+  return matches;
+}
+
+async function refreshPositionsWalletDashboard(w,target){
+  const rows=await positions(w);
+  let matches=0;
+
+  for(const c of rows){
+    if(!comboMatch(c,target))continue;
+
+    matches++;
+    const cid=String(c.combo_condition_id||c.combo_position_id||"");
+    if(!cid)continue;
+
+    q.pos.run(
+      w,
+      cid,
+      String(c.combo_position_id||cid),
+      num(c.entry_cost_usdc),
+      num(c.total_cost_usdc),
+      num(c.current_value_usdc),
+      num(c.shares_balance),
+      String(c.status||""),
+      String(c.first_entry_at||""),
+      String(c.resolved_at||""),
+      String(c.updated_at||""),
+      now()
+    );
+
+    saveLegs(cid,c.legs||[]);
+  }
+
+  return matches;
+}
+
 async function refreshPositionsWallet(w,target,slug){
   let matches=0;
   await comboPages("positions",w,async rows=>{
@@ -281,102 +237,201 @@ async function mapPool(items,limit,fn,cb){const qx=[...items];let done=0,hits=0;
 async function eventBySlug(s){return await fetchJ(`${GAMMA}/events/slug/${encodeURIComponent(s)}`,{timeout:10000},3)}
 async function relatedEvents(main){const out=new Map([[String(main.slug||""),main]]),gid=main.gameId||main.game_id||(main.sports||{}).gameId;if(!gid)return[...out.values()];let c=null;for(let i=0;i<5;i++){const u=new URL(`${GAMMA}/events/keyset`);u.searchParams.set("game_id",String(gid));u.searchParams.set("limit","100");if(c)u.searchParams.set("after_cursor",c);let d;try{d=await fetchJ(u.toString(),{timeout:10000},3)}catch{break}for(const e of(d.events||d.items||[])){const s=String(e.slug||"");if(!s)continue;try{out.set(s,await eventBySlug(s))}catch{out.set(s,e)}}c=d.next_cursor||d.nextCursor||null;if(!c)break}return[...out.values()]}
 function marketRows(events){const rows=[];for(const e of events)for(const m of e.markets||[]){const cid=String(m.conditionId||m.condition_id||"").toLowerCase();if(cid)rows.push({condition_id:cid,market_slug:String(m.slug||""),market_title:String(m.question||m.title||"")})}return rows}
-function startMs(events){const xs=[];for(const e of events)for(const k of["creationDate","createdAt","startDate"]){const x=Date.parse(e[k]||"");if(Number.isFinite(x))xs.push(x)}return Math.max(xs.length?Math.min(...xs)-4*3600e3:Date.now()-5*86400e3,Date.now()-30*86400e3)}
+function startMs(events){
+  const nowMs=Date.now();
+  const creations=[],starts=[];
+  for(const e of events||[]){
+    for(const k of ["creationDate","createdAt","created_at"]){
+      const x=Date.parse(e?.[k]||"");
+      if(Number.isFinite(x))creations.push(x);
+    }
+    for(const k of ["startDate","start_date"]){
+      const x=Date.parse(e?.[k]||"");
+      if(Number.isFinite(x))starts.push(x);
+    }
+  }
+
+  let start;
+  if(creations.length)start=Math.min(...creations);
+  else if(starts.length)start=Math.min(...starts)-24*3600e3;
+  else start=nowMs-5*86400e3;
+
+  start-=PRE_EVENT_MARGIN_HOURS*3600e3;
+  return Math.max(start,nowMs-MAX_INITIAL_SCAN_DAYS*86400e3);
+}
 function trackedResult(slug,main,target){const ids=[...target],marks=ids.map(()=>"?").join(",");if(!ids.length)return{event:main,combos:[],newCombos:0};const combos=db.prepare(`WITH m AS(SELECT DISTINCT combo_id FROM combo_legs WHERE condition_id IN (${marks})),p AS(SELECT p.combo_id,COUNT(DISTINCT p.wallet) wallets,COUNT(*) positions,SUM(CASE WHEN (p.resolved_at IS NULL OR p.resolved_at='') AND p.shares>0.0001 THEN p.entry_cost ELSE 0 END) open_entry,SUM(p.entry_cost) total_entry FROM combo_positions p JOIN m ON m.combo_id=p.combo_id GROUP BY p.combo_id),a AS(SELECT a.combo_id,COUNT(*) activity_events,SUM(a.amount_usdc) activity_amount FROM combo_activity a JOIN m ON m.combo_id=a.combo_id GROUP BY a.combo_id) SELECT p.*,COALESCE(a.activity_events,0) activity_events,COALESCE(a.activity_amount,0) activity_amount FROM p LEFT JOIN a ON a.combo_id=p.combo_id ORDER BY open_entry DESC,total_entry DESC`).all(...ids);for(const c of combos){c.legs=db.prepare("SELECT leg_index,condition_id,event_title,market_title,outcome,event_slug,market_slug FROM combo_legs WHERE combo_id=? ORDER BY leg_index").all(c.combo_id);c.wallet_list=db.prepare("SELECT wallet,position_id,entry_cost,total_cost,current_value,shares,status,first_entry_at,resolved_at FROM combo_positions WHERE combo_id=? ORDER BY entry_cost DESC").all(c.combo_id);c.first_seen=db.prepare("SELECT first_seen_utc FROM tracked_combo_seen WHERE slug=? AND combo_id=?").get(slug,c.combo_id)?.first_seen_utc||""}return{event:main,combos}}
 async function trackJob(id,input){
   try{
     const slug=slugOf(input);
-    setP(id,{status:"running",message:"A identificar o jogo..."});
 
+    setP(id,{status:"running",message:"[1/6] Evento e mercados..."});
     const main=await eventBySlug(slug);
     const events=await relatedEvents(main);
     const mrs=marketRows(events);
     const target=new Set(mrs.map(x=>x.condition_id));
 
-    db.prepare("INSERT INTO tracked_games(slug,event_id,title,start_time,last_scanned_block,last_run_utc) VALUES(?,?,?,?,0,?) ON CONFLICT(slug) DO UPDATE SET event_id=excluded.event_id,title=excluded.title,start_time=excluded.start_time")
-      .run(slug,String(main.id||""),String(main.title||slug),String(main.startDate||main.endDate||""),now());
+    if(!target.size)throw new Error("Sem condition IDs para este jogo.");
+
+    db.prepare(`
+      INSERT INTO tracked_games(slug,event_id,title,start_time,last_scanned_block,last_run_utc)
+      VALUES(?,?,?,?,0,?)
+      ON CONFLICT(slug) DO UPDATE SET
+        event_id=excluded.event_id,
+        title=excluded.title,
+        start_time=excluded.start_time
+    `).run(
+      slug,
+      String(main.id||""),
+      String(main.title||slug),
+      String(main.startDate||main.endDate||""),
+      now()
+    );
 
     for(const m of mrs){
-      db.prepare("INSERT OR REPLACE INTO tracked_markets(slug,condition_id,market_slug,market_title) VALUES(?,?,?,?)")
-        .run(slug,m.condition_id,m.market_slug,m.market_title);
+      db.prepare(`
+        INSERT OR REPLACE INTO tracked_markets(slug,condition_id,market_slug,market_title)
+        VALUES(?,?,?,?)
+      `).run(slug,m.condition_id,m.market_slug,m.market_title);
     }
 
-    const before=new Set(
+    const tg=db.prepare("SELECT last_scanned_block FROM tracked_games WHERE slug=?").get(slug);
+    const lastScanned=Number(tg?.last_scanned_block||0);
+    const firstRun=lastScanned<=0;
+
+    setP(id,{status:"running",message:"[2/6] Definir scan incremental..."});
+
+    const hi=await latest();
+    let lo;
+
+    if(firstRun){
+      lo=await findBlock(Math.floor(startMs(events)/1000),hi);
+    }else{
+      lo=lastScanned+1;
+    }
+
+    const previousCandidates=new Set(
+      db.prepare("SELECT wallet FROM tracked_candidates WHERE slug=?").all(slug).map(r=>r.wallet)
+    );
+
+    const previousMatches=new Set(
+      db.prepare("SELECT wallet FROM tracked_matches WHERE slug=?").all(slug).map(r=>r.wallet)
+    );
+
+    const beforeCombos=new Set(
       db.prepare("SELECT combo_id FROM tracked_combo_seen WHERE slug=?").all(slug).map(r=>r.combo_id)
     );
 
-    setP(id,{status:"running",message:`A obter proxy wallets dos ${target.size} mercados do jogo...`});
+    setP(id,{status:"running",message:"[3/6] Novos logs Combo..."});
 
-    const mp=await marketPositionWallets([...target],"ALL",p=>{
-      const msg=`Mercados ${p.done}/${p.total} · ${p.wallets} proxy wallets · ${p.positions} posições`;
+    const sc=await scanLogs(lo,hi,p=>{
+      const msg=`Logs ${p.done}/${p.total} · ${p.logs} eventos · ${p.wallets} wallets`;
       setP(id,{status:"running",message:msg,...p});
+      if(p.done===1||p.done%10===0||p.done===p.total)console.log(`TRACK ${slug}: ${msg}`);
     });
 
-    let candidates=new Set(mp.wallets);
+    let newlySeen=new Set(sc.wallets);
 
-    // If market positions are unexpectedly sparse, use market trades as a bounded coverage extension.
-    if(candidates.size<20){
-      setP(id,{status:"running",message:"Poucas wallets nas posições; a acrescentar traders do mercado..."});
-      const mt=await marketTradeWallets([...target],p=>{
-        setP(id,{
-          status:"running",
-          message:`Trades ${p.done}/${p.total} · ${p.wallets} proxy wallets · ${p.trades} trades`
-        });
+    if(newlySeen.size<TOPIC_FALLBACK_MIN && sc.txs.length){
+      setP(id,{
+        status:"running",
+        message:`Topics só deram ${newlySeen.size} wallets. Fallback tx.from até ${TX_FALLBACK_MAX} TXs...`
       });
-      for(const w of mt.wallets)candidates.add(w);
+
+      const txw=await txFallback(sc.txs,(d,t,n)=>{
+        setP(id,{status:"running",message:`TX fallback ${d}/${t} · ${n} senders`});
+      });
+
+      for(const w of txw)newlySeen.add(w);
     }
 
-    const knownMatch=db.prepare("SELECT wallet FROM tracked_matches WHERE slug=?").all(slug).map(r=>r.wallet);
-    for(const w of knownMatch)candidates.add(w);
-
-    for(const w of candidates){
+    for(const w of newlySeen){
       db.prepare("INSERT OR IGNORE INTO tracked_candidates(slug,wallet) VALUES(?,?)").run(slug,w);
+      q.wallet.run(w,now(),now());
     }
 
-    const wallets=[...candidates];
-    console.log(`Tracking ${slug}: ${target.size} mercados | ${wallets.length} proxy wallets`);
+    const allCandidates=new Set([...previousCandidates,...newlySeen]);
+    const newCandidates=[...newlySeen].filter(w=>!previousCandidates.has(w));
 
-    // First query combo positions, because this is the direct object we ultimately need.
-    setP(id,{status:"running",message:`Combo Positions: 0/${wallets.length}`});
+    // FAST v2:
+    // first run -> all candidate wallets
+    // incremental -> only new candidate wallets
+    const activityScan=firstRun?[...allCandidates]:newCandidates;
+
+    setP(id,{
+      status:"running",
+      message:`[4/6] Activity relevante: ${activityScan.length} wallets`
+    });
+
     await mapPool(
-      wallets,
-      TRACK_POSITION_CONCURRENCY,
-      w=>refreshPositionsWallet(w,target,slug),
+      activityScan,
+      TRACK_ACTIVITY_CONCURRENCY,
+      w=>refreshActivityWallet(w,target,slug),
       p=>{
-        const msg=`Combo Positions ${p.done}/${p.total} · matches ${p.hits}`;
+        const msg=`Activity ${p.done}/${p.total} · ${p.hits} wallets match`;
         setP(id,{status:"running",message:msg,...p});
-        if(p.done===1||p.done%25===0||p.done===p.total)console.log(msg);
+        if(p.done===1||p.done%50===0||p.done===p.total)console.log(`TRACK ${slug}: ${msg}`);
       }
     );
 
-    // Activity only for wallets that actually matched. This keeps the job much lighter.
-    const matches=db.prepare("SELECT wallet FROM tracked_matches WHERE slug=?").all(slug).map(r=>r.wallet);
-    if(matches.length){
-      setP(id,{status:"running",message:`Activity das ${matches.length} wallets com Combo...`});
+    // Refresh known match wallets every run, as in FAST v2.
+    if(!firstRun && previousMatches.size){
+      const old=[...previousMatches];
+
+      setP(id,{
+        status:"running",
+        message:`A refrescar Activity de ${old.length} wallets já conhecidas com match...`
+      });
+
       await mapPool(
-        matches,
+        old,
         TRACK_ACTIVITY_CONCURRENCY,
         w=>refreshActivityWallet(w,target,slug),
         p=>{
-          const msg=`Activity ${p.done}/${p.total}`;
-          setP(id,{status:"running",message:msg,...p});
+          if(p.done===1||p.done%50===0||p.done===p.total){
+            setP(id,{status:"running",message:`Refresh Activity ${p.done}/${p.total}`,...p});
+          }
         }
       );
     }
 
-    db.prepare("UPDATE tracked_games SET last_run_utc=? WHERE slug=?").run(now(),slug);
+    const allMatches=new Set(
+      db.prepare("SELECT wallet FROM tracked_matches WHERE slug=?").all(slug).map(r=>r.wallet)
+    );
+
+    setP(id,{
+      status:"running",
+      message:`[5/6] Positions: ${allMatches.size} wallets relevantes`
+    });
+
+    await mapPool(
+      [...allMatches],
+      TRACK_POSITION_CONCURRENCY,
+      w=>refreshPositionsWallet(w,target,slug),
+      p=>{
+        const msg=`Positions ${p.done}/${p.total} · ${p.hits} rows match`;
+        setP(id,{status:"running",message:msg,...p});
+        if(p.done===1||p.done%25===0||p.done===p.total)console.log(`TRACK ${slug}: ${msg}`);
+      }
+    );
 
     const result=trackedResult(slug,main,target);
     const after=new Set(result.combos.map(c=>c.combo_id));
-    result.newCombos=[...after].filter(x=>!before.has(x)).length;
-    result.incremental=before.size>0;
-    result.newCandidateWallets=wallets.length;
+
+    result.newCombos=[...after].filter(x=>!beforeCombos.has(x)).length;
+    result.incremental=!firstRun;
+    result.newCandidateWallets=newCandidates.length;
+
+    // Only checkpoint after successful end-to-end execution.
+    db.prepare(
+      "UPDATE tracked_games SET last_scanned_block=?,last_run_utc=? WHERE slug=?"
+    ).run(hi,now(),slug);
 
     setP(id,{
       status:"done",
-      message:`Concluído: ${result.combos.length} combos · ${result.newCombos} novas · ${wallets.length} proxy wallets`,
+      message:`Concluído: ${result.combos.length} combos · ${result.newCombos} novas · ${allMatches.size} wallets com match`,
       result
     });
+
   }catch(e){
     setP(id,{status:"error",message:String(e.message||e)});
   }
@@ -678,10 +733,12 @@ function dashboardRows(){
   `).all()
 }
 async function dashboardJob(id,source="manual"){
-  const hardDeadline=Date.now()+8*60*1000;
-  const checkDeadline=()=>{if(Date.now()>hardDeadline)throw new Error("Dashboard excedeu o limite de 8 minutos.");};
   if(dashboardRunning){
-    setP(id,{status:"done",message:"Já existe uma atualização do Dashboard em curso.",result:{rows:dashboardRows(),auto:autoState}});
+    setP(id,{
+      status:"done",
+      message:"Já existe uma atualização do Dashboard em curso.",
+      result:{rows:dashboardRows(),auto:autoState}
+    });
     return;
   }
 
@@ -690,80 +747,163 @@ async function dashboardJob(id,source="manual"){
   autoState.lastStarted=now();
   autoState.lastError=null;
 
-  const combosBefore=Number(db.prepare("SELECT COUNT(DISTINCT combo_id) n FROM combo_positions").get().n||0);
-  const walletsBefore=Number(db.prepare("SELECT COUNT(*) n FROM dashboard_match_wallets").get().n||0);
+  const combosBefore=Number(
+    db.prepare("SELECT COUNT(DISTINCT combo_id) n FROM combo_positions").get().n||0
+  );
+
+  const walletsBefore=Number(
+    db.prepare("SELECT COUNT(*) n FROM dashboard_match_wallets").get().n||0
+  );
 
   try{
-    setP(id,{status:"running",message:source==="auto"?"Auto-refresh: a atualizar jogos CS2 ativos...":"A atualizar jogos CS2 ativos..."});
-    const activeInfo=await refreshActive(p=>{
-      const msg=`Jogos CS2 ${p.done}/${p.total} · ${p.markets} mercados · ${p.failed} falhas`;
-      setP(id,{status:"running",phase:"games",message:msg});
-    });
-    cleanupDatabase();
-    if(!activeInfo.markets){
-      throw new Error(`Foram encontrados ${activeInfo.events} eventos CS2, mas 0 mercados foram extraídos.`);
-    }
-    checkDeadline();
-
-    const activeConditionIds=db.prepare("SELECT DISTINCT condition_id FROM active_game_markets").all().map(r=>r.condition_id);
+    // 1) Active CS2 games
     setP(id,{
       status:"running",
-      phase:"markets",
-      message:`A obter proxy wallets de ${activeConditionIds.length} mercados CS2...`
+      phase:"games",
+      message:"[1/5] A atualizar jogos CS2 ativos..."
     });
 
-    const marketCandidates=await marketPositionWallets(activeConditionIds,"OPEN",p=>{
-      const msg=`Mercados ${p.done}/${p.total} · ${p.wallets} proxy wallets · ${p.positions} posições`;
-      setP(id,{status:"running",phase:"markets",message:msg,...p});
-      if(p.done===1||p.done%25===0||p.done===p.total)console.log(msg);
+    const activeInfo=await refreshActive(p=>{
+      setP(id,{
+        status:"running",
+        phase:"games",
+        message:`Jogos CS2 ${p.done}/${p.total} · ${p.markets} mercados`
+      });
     });
 
-    console.log(
-      `Dashboard market-first: ${marketCandidates.markets} mercados | `+
-      `${marketCandidates.wallets.length} proxy wallets | ${marketCandidates.positions} posições`
+    if(!activeInfo.markets)throw new Error("Foram encontrados jogos CS2, mas 0 mercados.");
+
+    const target=new Set(
+      db.prepare("SELECT DISTINCT condition_id FROM active_game_markets").all().map(r=>r.condition_id)
     );
 
-    const known=db.prepare(
-      "SELECT wallet FROM dashboard_match_wallets UNION SELECT wallet FROM tracked_matches"
-    ).all().map(r=>r.wallet);
+    // 2) Incremental blockchain window.
+    const hi=await latest();
+    let lo=Number(q.getMeta.get("dashboard_last_block")?.value||0);
+    const firstRun=lo<=0;
 
-    const wallets=[...new Set([...marketCandidates.wallets,...known])];
+    if(firstRun){
+      // Mirror Watcher MAX_INITIAL_SCAN_DAYS coverage for initial dashboard build.
+      lo=await findBlock(
+        Math.floor((Date.now()-MAX_INITIAL_SCAN_DAYS*86400e3)/1000),
+        hi
+      );
+    }else{
+      lo++;
+    }
 
-    setP(id,{status:"running",phase:"wallets",message:`A verificar Combo Positions de ${wallets.length} proxy wallets...`});
-    console.log(`Dashboard proxy wallets: ${wallets.length} para analisar`);
+    setP(id,{
+      status:"running",
+      phase:"blockchain",
+      message:`[2/5] Logs Combo ${lo} → ${hi}...`
+    });
 
-    checkDeadline();
-    await mapPool(
-      wallets,
-      DASHBOARD_POSITION_CONCURRENCY,
-      async w=>{
-        let matched=false;
-        const activeIds=new Set(db.prepare("SELECT condition_id FROM active_game_markets").all().map(r=>String(r.condition_id).toLowerCase()));
-        await comboPages("positions",w,async rows=>{
-          for(const c of rows){
-            const cid=String(c.combo_condition_id||c.combo_position_id||"");
-            if(!cid)continue;
-            const hits=(c.legs||[]).some(l=>activeIds.has(legCid(l)));
-            if(!hits)continue;
-            matched=true;
-            saveLegs(cid,c.legs||[]);
-            q.pos.run(w,cid,String(c.combo_position_id||cid),num(c.entry_cost_usdc),num(c.total_cost_usdc),num(c.current_value_usdc),num(c.shares_balance),String(c.status||""),String(c.first_entry_at||""),String(c.resolved_at||""),String(c.updated_at||""),now());
-          }
+    const sc=await scanLogs(lo,hi,p=>{
+      const msg=`Logs ${p.done}/${p.total} · ${p.logs} eventos · ${p.wallets} wallets`;
+      setP(id,{status:"running",phase:"blockchain",message:msg,...p});
+      if(p.done===1||p.done%10===0||p.done===p.total)console.log(`DASH: ${msg}`);
+    });
+
+    let newlySeen=new Set(sc.wallets);
+
+    if(newlySeen.size<TOPIC_FALLBACK_MIN && sc.txs.length){
+      setP(id,{
+        status:"running",
+        phase:"blockchain",
+        message:`Topics só deram ${newlySeen.size} wallets. Fallback tx.from...`
+      });
+
+      const txw=await txFallback(sc.txs,(d,t,n)=>{
+        setP(id,{
+          status:"running",
+          phase:"blockchain",
+          message:`TX fallback ${d}/${t} · ${n} senders`
         });
-        if(matched)db.prepare("INSERT OR REPLACE INTO dashboard_match_wallets(wallet,last_match_utc) VALUES(?,?)").run(w,now());
-        return matched;
-      },
+      });
+
+      for(const w of txw)newlySeen.add(w);
+    }
+
+    for(const w of newlySeen)q.wallet.run(w,now(),now());
+
+    const knownMatches=new Set(
+      db.prepare("SELECT wallet FROM dashboard_match_wallets").all().map(r=>r.wallet)
+    );
+
+    // On first run, all discovered wallets need Activity scan.
+    // On incremental runs, scan only newly seen wallets + refresh known matches.
+    const activityScan=firstRun?[...newlySeen]:[...newlySeen].filter(w=>!knownMatches.has(w));
+
+    setP(id,{
+      status:"running",
+      phase:"activity",
+      message:`[3/5] Activity: ${activityScan.length} novas/candidatas`
+    });
+
+    await mapPool(
+      activityScan,
+      DASHBOARD_ACTIVITY_CONCURRENCY,
+      w=>refreshActivityWalletDashboard(w,target),
       p=>{
-        const msg=`Wallets ${p.done}/${p.total} · matches ${p.hits}`;
-        setP(id,{status:"running",phase:"wallets",message:msg,...p});
-        if(p.done===1 || p.done%25===0 || p.done===p.total)console.log(msg);
+        const msg=`Activity ${p.done}/${p.total} · ${p.hits} wallets match`;
+        setP(id,{status:"running",phase:"activity",message:msg,...p});
+        if(p.done===1||p.done%50===0||p.done===p.total)console.log(`DASH: ${msg}`);
       }
     );
 
+    // Refresh wallets already proven relevant.
+    if(!firstRun && knownMatches.size){
+      const old=[...knownMatches];
+
+      await mapPool(
+        old,
+        DASHBOARD_ACTIVITY_CONCURRENCY,
+        w=>refreshActivityWalletDashboard(w,target),
+        p=>{
+          if(p.done===1||p.done%50===0||p.done===p.total){
+            setP(id,{
+              status:"running",
+              phase:"activity",
+              message:`Refresh Activity ${p.done}/${p.total}`
+            });
+          }
+        }
+      );
+    }
+
+    const matchedWallets=new Set(
+      db.prepare("SELECT wallet FROM dashboard_match_wallets").all().map(r=>r.wallet)
+    );
+
+    setP(id,{
+      status:"running",
+      phase:"positions",
+      message:`[4/5] Positions: ${matchedWallets.size} wallets relevantes`
+    });
+
+    await mapPool(
+      [...matchedWallets],
+      DASHBOARD_POSITION_CONCURRENCY,
+      w=>refreshPositionsWalletDashboard(w,target),
+      p=>{
+        const msg=`Positions ${p.done}/${p.total} · ${p.hits} rows match`;
+        setP(id,{status:"running",phase:"positions",message:msg,...p});
+        if(p.done===1||p.done%25===0||p.done===p.total)console.log(`DASH: ${msg}`);
+      }
+    );
+
+    // Checkpoint only on success.
+    q.setMeta.run("dashboard_last_block",String(hi));
+
     cleanupDatabase();
+
     const rows=dashboardRows();
-    const combosAfter=Number(db.prepare("SELECT COUNT(DISTINCT combo_id) n FROM combo_positions").get().n||0);
-    const walletsAfter=Number(db.prepare("SELECT COUNT(*) n FROM dashboard_match_wallets").get().n||0);
+    const combosAfter=Number(
+      db.prepare("SELECT COUNT(DISTINCT combo_id) n FROM combo_positions").get().n||0
+    );
+    const walletsAfter=Number(
+      db.prepare("SELECT COUNT(*) n FROM dashboard_match_wallets").get().n||0
+    );
 
     autoState.lastNewCombos=Math.max(0,combosAfter-combosBefore);
     autoState.lastNewWallets=Math.max(0,walletsAfter-walletsBefore);
@@ -773,14 +913,15 @@ async function dashboardJob(id,source="manual"){
 
     setP(id,{
       status:"done",
-      message:`Dashboard atualizado: ${rows.length} jogos · +${autoState.lastNewCombos} combos · +${autoState.lastNewWallets} wallets`,
+      phase:"done",
+      message:`[5/5] Dashboard: ${rows.length} jogos · ${combosAfter} combos · ${walletsAfter} wallets com match`,
       result:{rows,auto:autoState}
     });
 
   }catch(e){
     autoState.lastError=String(e.message||e);
     autoState.lastFinished=now();
-    setP(id,{status:"error",message:autoState.lastError});
+    setP(id,{status:"error",phase:"error",message:autoState.lastError});
   }finally{
     dashboardRunning=false;
     autoState.running=false;
@@ -858,6 +999,6 @@ dbBytes:(()=>{try{return fs.statSync(DB_PATH).size}catch{return 0}})(),
 auto:autoState
 });
 if(req.method==="GET"&&u.pathname==="/api/dashboard/auto")return json(res,200,{auto:autoState});if(req.method==="POST"&&u.pathname==="/api/track"){const b=await body(req),id=jid();setP(id,{status:"queued",message:"A iniciar..."});trackJob(id,b.input);return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/tracked")return json(res,200,{rows:db.prepare("SELECT slug,title,start_time,last_run_utc FROM tracked_games ORDER BY last_run_utc DESC").all()});if(req.method==="POST"&&u.pathname==="/api/dashboard/refresh"){const id=jid();setP(id,{status:"queued",message:"A iniciar..."});dashboardJob(id,"manual");return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/dashboard")return json(res,200,{rows:dashboardRows()});if(req.method==="GET"&&u.pathname.startsWith("/api/jobs/"))return json(res,200,progress.get(u.pathname.split("/").pop())||{status:"unknown"});let f=u.pathname==="/"?"index.html":u.pathname.replace(/^\/+/,"");const fp=path.join(pub,f);if(!fp.startsWith(pub)||!fs.existsSync(fp))return json(res,404,{error:"not found"});const ext=path.extname(fp),types={".html":"text/html; charset=utf-8",".css":"text/css; charset=utf-8",".js":"text/javascript; charset=utf-8"};res.writeHead(200,{"content-type":types[ext]||"application/octet-stream","cache-control":"no-store"});res.end(fs.readFileSync(fp))}catch(e){json(res,500,{error:String(e.message||e)})}}).listen(PORT,HOST,()=>{
-console.log(`\nCS2 Combo Tracker ONLINE v11 MARKET FIRST: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos | v9 progress\n`);
+console.log(`\nCS2 Combo Tracker ONLINE v13 WATCHER ENGINE: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos | v9 progress\n`);
 startDashboardAuto();
 });
