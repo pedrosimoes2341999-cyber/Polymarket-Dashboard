@@ -1,5 +1,9 @@
-APP_USER=pedro
-APP_PASSWORD=CHANGE_THIS_PASSWORD
-SESSION_SECRET=4kc_MsfJCofi1HCojAHnaBeQuBnyPRq_w3Xa3fdtafw
-DATA_DIR=/data
-HOST=0.0.0.0
+FROM node:22-slim
+
+WORKDIR /app
+
+COPY . .
+
+ENV NODE_ENV=production
+
+CMD ["npm", "start"]
