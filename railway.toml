@@ -1,0 +1,11 @@
+{
+  "name": "polymarket-cs2-combo-tracker",
+  "version": "5.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node --no-warnings server.js"
+  }
+}
