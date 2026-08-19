@@ -332,6 +332,21 @@ function trackedResult(slug,main,target){
       ORDER BY leg_index
     `).all(c.combo_id);
 
+    const activityByWallet=db.prepare(`
+      SELECT
+        wallet,
+        COUNT(*) activity_events,
+        COALESCE(SUM(amount_usdc),0) activity_amount,
+        COALESCE(SUM(payout_usdc),0) activity_payout,
+        MIN(CASE WHEN tx_dttm IS NOT NULL AND tx_dttm<>'' THEN tx_dttm END) first_activity_at,
+        MAX(CASE WHEN tx_dttm IS NOT NULL AND tx_dttm<>'' THEN tx_dttm END) last_activity_at
+      FROM combo_activity
+      WHERE combo_id=?
+      GROUP BY wallet
+    `).all(c.combo_id);
+
+    const actMap=new Map(activityByWallet.map(x=>[x.wallet,x]));
+
     const posWallets=db.prepare(`
       SELECT
         wallet,position_id,entry_cost,total_cost,current_value,shares,status,
@@ -340,27 +355,40 @@ function trackedResult(slug,main,target){
       FROM combo_positions
       WHERE combo_id=?
       ORDER BY entry_cost DESC
-    `).all(c.combo_id);
+    `).all(c.combo_id).map(x=>{
+      const a=actMap.get(x.wallet)||{};
+      return {
+        ...x,
+        activity_events:Number(a.activity_events||0),
+        activity_amount:Number(a.activity_amount||0),
+        activity_payout:Number(a.activity_payout||0),
+        first_activity_at:a.first_activity_at||"",
+        last_activity_at:a.last_activity_at||""
+      };
+    });
 
     const posSet=new Set(posWallets.map(x=>x.wallet));
 
-    const activityOnly=db.prepare(`
-      SELECT
-        wallet,
-        '' position_id,
-        0 entry_cost,
-        0 total_cost,
-        0 current_value,
-        0 shares,
-        'Activity' status,
-        MIN(tx_dttm) first_entry_at,
-        '' resolved_at,
-        'ACTIVITY' source
-      FROM combo_activity
-      WHERE combo_id=?
-      GROUP BY wallet
-      ORDER BY MIN(tx_dttm)
-    `).all(c.combo_id).filter(x=>!posSet.has(x.wallet));
+    const activityOnly=activityByWallet
+      .filter(a=>!posSet.has(a.wallet))
+      .map(a=>({
+        wallet:a.wallet,
+        position_id:"",
+        entry_cost:0,
+        total_cost:0,
+        current_value:0,
+        shares:0,
+        status:"Sem posição atual",
+        first_entry_at:a.first_activity_at||"",
+        resolved_at:"",
+        source:"ACTIVITY",
+        activity_events:Number(a.activity_events||0),
+        activity_amount:Number(a.activity_amount||0),
+        activity_payout:Number(a.activity_payout||0),
+        first_activity_at:a.first_activity_at||"",
+        last_activity_at:a.last_activity_at||""
+      }))
+      .sort((a,b)=>Number(b.activity_amount||0)-Number(a.activity_amount||0));
 
     c.wallet_list=[...posWallets,...activityOnly];
     c.wallets=new Set(c.wallet_list.map(x=>x.wallet)).size;
@@ -1119,6 +1147,6 @@ dbBytes:(()=>{try{return fs.statSync(DB_PATH).size}catch{return 0}})(),
 auto:autoState
 });
 if(req.method==="GET"&&u.pathname==="/api/dashboard/auto")return json(res,200,{auto:autoState});if(req.method==="POST"&&u.pathname==="/api/track"){const b=await body(req),id=jid();setP(id,{status:"queued",message:"A iniciar..."});trackJob(id,b.input);return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/tracked")return json(res,200,{rows:db.prepare("SELECT slug,title,start_time,last_run_utc FROM tracked_games ORDER BY last_run_utc DESC").all()});if(req.method==="POST"&&u.pathname==="/api/dashboard/refresh"){const id=jid();setP(id,{status:"queued",message:"A iniciar..."});dashboardJob(id,"manual");return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/dashboard")return json(res,200,{rows:dashboardRows()});if(req.method==="GET"&&u.pathname.startsWith("/api/jobs/"))return json(res,200,progress.get(u.pathname.split("/").pop())||{status:"unknown"});let f=u.pathname==="/"?"index.html":u.pathname.replace(/^\/+/,"");const fp=path.join(pub,f);if(!fp.startsWith(pub)||!fs.existsSync(fp))return json(res,404,{error:"not found"});const ext=path.extname(fp),types={".html":"text/html; charset=utf-8",".css":"text/css; charset=utf-8",".js":"text/javascript; charset=utf-8"};res.writeHead(200,{"content-type":types[ext]||"application/octet-stream","cache-control":"no-store"});res.end(fs.readFileSync(fp))}catch(e){json(res,500,{error:String(e.message||e)})}}).listen(PORT,HOST,()=>{
-console.log(`\nCS2 Combo Tracker ONLINE v14 ACTIVITY + POSITIONS: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos | v9 progress\n`);
+console.log(`\nCS2 Combo Tracker ONLINE v15 ACTIVITY VALUES: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos | v9 progress\n`);
 startDashboardAuto();
 });
