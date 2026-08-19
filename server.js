@@ -259,7 +259,118 @@ function startMs(events){
   start-=PRE_EVENT_MARGIN_HOURS*3600e3;
   return Math.max(start,nowMs-MAX_INITIAL_SCAN_DAYS*86400e3);
 }
-function trackedResult(slug,main,target){const ids=[...target],marks=ids.map(()=>"?").join(",");if(!ids.length)return{event:main,combos:[],newCombos:0};const combos=db.prepare(`WITH m AS(SELECT DISTINCT combo_id FROM combo_legs WHERE condition_id IN (${marks})),p AS(SELECT p.combo_id,COUNT(DISTINCT p.wallet) wallets,COUNT(*) positions,SUM(CASE WHEN (p.resolved_at IS NULL OR p.resolved_at='') AND p.shares>0.0001 THEN p.entry_cost ELSE 0 END) open_entry,SUM(p.entry_cost) total_entry FROM combo_positions p JOIN m ON m.combo_id=p.combo_id GROUP BY p.combo_id),a AS(SELECT a.combo_id,COUNT(*) activity_events,SUM(a.amount_usdc) activity_amount FROM combo_activity a JOIN m ON m.combo_id=a.combo_id GROUP BY a.combo_id) SELECT p.*,COALESCE(a.activity_events,0) activity_events,COALESCE(a.activity_amount,0) activity_amount FROM p LEFT JOIN a ON a.combo_id=p.combo_id ORDER BY open_entry DESC,total_entry DESC`).all(...ids);for(const c of combos){c.legs=db.prepare("SELECT leg_index,condition_id,event_title,market_title,outcome,event_slug,market_slug FROM combo_legs WHERE combo_id=? ORDER BY leg_index").all(c.combo_id);c.wallet_list=db.prepare("SELECT wallet,position_id,entry_cost,total_cost,current_value,shares,status,first_entry_at,resolved_at FROM combo_positions WHERE combo_id=? ORDER BY entry_cost DESC").all(c.combo_id);c.first_seen=db.prepare("SELECT first_seen_utc FROM tracked_combo_seen WHERE slug=? AND combo_id=?").get(slug,c.combo_id)?.first_seen_utc||""}return{event:main,combos}}
+function trackedResult(slug,main,target){
+  const ids=[...target];
+  if(!ids.length)return{event:main,combos:[],newCombos:0};
+
+  const marks=ids.map(()=>"?").join(",");
+
+  // A combo is relevant if its saved legs match the target.
+  // IMPORTANT: do not require a current combo_position.
+  // The proven Python watcher aggregates Activity + Positions, so historical/closed
+  // combos detected in Activity must remain visible even when Positions is empty.
+  const combos=db.prepare(`
+    WITH m AS(
+      SELECT DISTINCT combo_id
+      FROM combo_legs
+      WHERE condition_id IN (${marks})
+    ),
+    p AS(
+      SELECT
+        p.combo_id,
+        COUNT(DISTINCT p.wallet) position_wallets,
+        COUNT(*) positions,
+        SUM(
+          CASE
+            WHEN (p.resolved_at IS NULL OR p.resolved_at='')
+             AND p.shares>0.0001
+            THEN p.entry_cost
+            ELSE 0
+          END
+        ) open_entry,
+        SUM(p.entry_cost) total_entry
+      FROM combo_positions p
+      JOIN m ON m.combo_id=p.combo_id
+      GROUP BY p.combo_id
+    ),
+    a AS(
+      SELECT
+        a.combo_id,
+        COUNT(DISTINCT a.wallet) activity_wallets,
+        COUNT(*) activity_events,
+        SUM(a.amount_usdc) activity_amount,
+        SUM(a.payout_usdc) activity_payout
+      FROM combo_activity a
+      JOIN m ON m.combo_id=a.combo_id
+      GROUP BY a.combo_id
+    )
+    SELECT
+      m.combo_id,
+      COALESCE(p.position_wallets,0) position_wallets,
+      COALESCE(a.activity_wallets,0) activity_wallets,
+      COALESCE(p.positions,0) positions,
+      COALESCE(p.open_entry,0) open_entry,
+      COALESCE(p.total_entry,0) total_entry,
+      COALESCE(a.activity_events,0) activity_events,
+      COALESCE(a.activity_amount,0) activity_amount,
+      COALESCE(a.activity_payout,0) activity_payout
+    FROM m
+    LEFT JOIN p ON p.combo_id=m.combo_id
+    LEFT JOIN a ON a.combo_id=m.combo_id
+    WHERE p.combo_id IS NOT NULL OR a.combo_id IS NOT NULL
+    ORDER BY
+      COALESCE(p.open_entry,0) DESC,
+      COALESCE(a.activity_amount,0) DESC,
+      COALESCE(a.activity_events,0) DESC
+  `).all(...ids);
+
+  for(const c of combos){
+    c.legs=db.prepare(`
+      SELECT leg_index,condition_id,event_title,market_title,outcome,event_slug,market_slug
+      FROM combo_legs
+      WHERE combo_id=?
+      ORDER BY leg_index
+    `).all(c.combo_id);
+
+    const posWallets=db.prepare(`
+      SELECT
+        wallet,position_id,entry_cost,total_cost,current_value,shares,status,
+        first_entry_at,resolved_at,
+        'POSITION' source
+      FROM combo_positions
+      WHERE combo_id=?
+      ORDER BY entry_cost DESC
+    `).all(c.combo_id);
+
+    const posSet=new Set(posWallets.map(x=>x.wallet));
+
+    const activityOnly=db.prepare(`
+      SELECT
+        wallet,
+        '' position_id,
+        0 entry_cost,
+        0 total_cost,
+        0 current_value,
+        0 shares,
+        'Activity' status,
+        MIN(tx_dttm) first_entry_at,
+        '' resolved_at,
+        'ACTIVITY' source
+      FROM combo_activity
+      WHERE combo_id=?
+      GROUP BY wallet
+      ORDER BY MIN(tx_dttm)
+    `).all(c.combo_id).filter(x=>!posSet.has(x.wallet));
+
+    c.wallet_list=[...posWallets,...activityOnly];
+    c.wallets=new Set(c.wallet_list.map(x=>x.wallet)).size;
+    c.first_seen=db.prepare(
+      "SELECT first_seen_utc FROM tracked_combo_seen WHERE slug=? AND combo_id=?"
+    ).get(slug,c.combo_id)?.first_seen_utc||"";
+  }
+
+  return{event:main,combos};
+}
 async function trackJob(id,input){
   try{
     const slug=slugOf(input);
@@ -691,46 +802,55 @@ function dashboardRows(){
     WITH linked AS(
       SELECT
         ag.game_key,
+        ag.event_slug,
+        ag.title,
+        ag.start_time,
         cl.combo_id
       FROM active_games ag
       JOIN active_game_markets gm ON gm.game_key=ag.game_key
       JOIN combo_legs cl ON cl.condition_id=gm.condition_id
       GROUP BY ag.game_key,cl.combo_id
     ),
-    comboagg AS(
+    pos AS(
       SELECT
-        l.game_key,
-        COUNT(DISTINCT l.combo_id) combo_count,
-        COUNT(DISTINCT p.wallet) wallet_count,
-        COUNT(p.position_id) position_count,
-        COALESCE(SUM(
+        combo_id,
+        COUNT(*) positions,
+        SUM(
           CASE
-            WHEN (p.resolved_at IS NULL OR p.resolved_at='')
-             AND p.shares>0.0001
-            THEN p.entry_cost
+            WHEN (resolved_at IS NULL OR resolved_at='')
+             AND shares>0.0001
+            THEN entry_cost
             ELSE 0
           END
-        ),0) open_entry
-      FROM linked l
-      LEFT JOIN combo_positions p ON p.combo_id=l.combo_id
-      GROUP BY l.game_key
+        ) open_entry
+      FROM combo_positions
+      GROUP BY combo_id
+    ),
+    wallets AS(
+      SELECT combo_id,wallet FROM combo_positions
+      UNION
+      SELECT combo_id,wallet FROM combo_activity
+    ),
+    wagg AS(
+      SELECT combo_id,COUNT(DISTINCT wallet) wallet_count
+      FROM wallets
+      GROUP BY combo_id
     )
     SELECT
-      ag.game_key,
-      ag.event_slug,
-      ag.title,
-      ag.start_time,
-      COALESCE(c.combo_count,0) combo_count,
-      COALESCE(c.wallet_count,0) wallet_count,
-      COALESCE(c.position_count,0) position_count,
-      COALESCE(c.open_entry,0) open_entry
-    FROM active_games ag
-    LEFT JOIN comboagg c ON c.game_key=ag.game_key
-    ORDER BY
-      COALESCE(c.open_entry,0) DESC,
-      COALESCE(c.combo_count,0) DESC,
-      ag.start_time ASC
-  `).all()
+      l.game_key,
+      l.event_slug,
+      l.title,
+      l.start_time,
+      COUNT(DISTINCT l.combo_id) combo_count,
+      COALESCE(SUM(DISTINCT COALESCE(w.wallet_count,0)),0) wallet_count,
+      COALESCE(SUM(COALESCE(p.positions,0)),0) position_count,
+      COALESCE(SUM(COALESCE(p.open_entry,0)),0) open_entry
+    FROM linked l
+    LEFT JOIN pos p ON p.combo_id=l.combo_id
+    LEFT JOIN wagg w ON w.combo_id=l.combo_id
+    GROUP BY l.game_key,l.event_slug,l.title,l.start_time
+    ORDER BY open_entry DESC,combo_count DESC
+  `).all();
 }
 async function dashboardJob(id,source="manual"){
   if(dashboardRunning){
@@ -999,6 +1119,6 @@ dbBytes:(()=>{try{return fs.statSync(DB_PATH).size}catch{return 0}})(),
 auto:autoState
 });
 if(req.method==="GET"&&u.pathname==="/api/dashboard/auto")return json(res,200,{auto:autoState});if(req.method==="POST"&&u.pathname==="/api/track"){const b=await body(req),id=jid();setP(id,{status:"queued",message:"A iniciar..."});trackJob(id,b.input);return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/tracked")return json(res,200,{rows:db.prepare("SELECT slug,title,start_time,last_run_utc FROM tracked_games ORDER BY last_run_utc DESC").all()});if(req.method==="POST"&&u.pathname==="/api/dashboard/refresh"){const id=jid();setP(id,{status:"queued",message:"A iniciar..."});dashboardJob(id,"manual");return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/dashboard")return json(res,200,{rows:dashboardRows()});if(req.method==="GET"&&u.pathname.startsWith("/api/jobs/"))return json(res,200,progress.get(u.pathname.split("/").pop())||{status:"unknown"});let f=u.pathname==="/"?"index.html":u.pathname.replace(/^\/+/,"");const fp=path.join(pub,f);if(!fp.startsWith(pub)||!fs.existsSync(fp))return json(res,404,{error:"not found"});const ext=path.extname(fp),types={".html":"text/html; charset=utf-8",".css":"text/css; charset=utf-8",".js":"text/javascript; charset=utf-8"};res.writeHead(200,{"content-type":types[ext]||"application/octet-stream","cache-control":"no-store"});res.end(fs.readFileSync(fp))}catch(e){json(res,500,{error:String(e.message||e)})}}).listen(PORT,HOST,()=>{
-console.log(`\nCS2 Combo Tracker ONLINE v13 WATCHER ENGINE: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos | v9 progress\n`);
+console.log(`\nCS2 Combo Tracker ONLINE v14 ACTIVITY + POSITIONS: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos | v9 progress\n`);
 startDashboardAuto();
 });
