@@ -16,12 +16,23 @@ function renderAuto(auto){
   $('#autoWallets').textContent=fmt(auto.lastNewWallets||0);
   const strip=document.querySelector('.auto-strip');
   if(strip)strip.classList.toggle('running',!!auto.running);
+  const box=document.getElementById('dashProgress');
+  if(box){
+    if(auto.running){
+      box.classList.remove('hidden');
+      box.textContent=auto.message||'Atualização automática em curso...';
+    }else if(auto.lastError){
+      box.classList.remove('hidden');
+      box.textContent='Erro: '+auto.lastError;
+    }else if(auto.lastFinished){
+      box.classList.add('hidden');
+    }
+  }
 }
 async function status(){
   try{
     const s=await api('/api/status');
-    const mb=(Number(s.dbBytes||0)/1024/1024).toFixed(1);
-    $('#dbStatus').innerHTML=`<b>${fmt(s.combos)} combos CS2 indexadas</b><br>${fmt(s.wallets)} wallets · ${fmt(s.positions)} posições<br>${fmt(s.tracked)} jogos em tracking · DB ${mb} MB`;
+    $('#dbStatus').innerHTML=`<b>${fmt(s.combos)} combos indexadas</b><br>${fmt(s.wallets)} wallets · ${fmt(s.positions)} posições<br>${fmt(s.tracked)} jogos em tracking`;
     renderAuto(s.auto);
   }catch{
     $('#dbStatus').textContent='Servidor offline'

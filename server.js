@@ -37,7 +37,9 @@ let autoState={
   lastError:null,
   lastNewCombos:0,
   lastNewWallets:0,
-  lastRows:0
+  lastRows:0,
+  phase:"idle",
+  message:"A aguardar próxima atualização"
 };
 
 const db=new DatabaseSync(DB_PATH);db.exec(`PRAGMA journal_mode=DELETE;PRAGMA synchronous=NORMAL;PRAGMA temp_store=MEMORY;
@@ -77,7 +79,17 @@ async function withTimeout(promise,ms,label="operation"){
   }
 }
 
-function setP(id,x){progress.set(id,{...x,updated:now()})}function slugOf(x){x=String(x||"").trim();if(/^https?:\/\//i.test(x)){const u=new URL(x);return u.pathname.replace(/\/+$/,"").split("/").pop()}return x.replace(/\/+$/,"").split("/").pop()}
+function setP(id,x){
+  const row={...x,updated:now()};
+  progress.set(id,row);
+  if(String(id).startsWith("auto_")){
+    if(x.message)autoState.message=x.message;
+    if(x.phase)autoState.phase=x.phase;
+    if(x.status==="running")autoState.running=true;
+    if(x.status==="done"){autoState.running=false;autoState.phase="done";autoState.message=x.message||"Concluído";}
+    if(x.status==="error"){autoState.running=false;autoState.phase="error";autoState.message=x.message||"Erro";}
+  }
+}function slugOf(x){x=String(x||"").trim();if(/^https?:\/\//i.test(x)){const u=new URL(x);return u.pathname.replace(/\/+$/,"").split("/").pop()}return x.replace(/\/+$/,"").split("/").pop()}
 async function fetchJ(url,opt={},retries=4){let last;for(let i=0;i<retries;i++){try{const c=new AbortController(),t=setTimeout(()=>c.abort(),opt.timeout||15000);const r=await fetch(url,{...opt,signal:c.signal,headers:{Accept:"application/json",...(opt.headers||{})}});clearTimeout(t);if(r.status===429||r.status>=500){await sleep(Math.min(500*2**i,5000));continue}if(!r.ok)throw Error(`${r.status} ${r.statusText}`);return await r.json()}catch(e){last=e;await sleep(Math.min(400*2**i,4000))}}throw last||Error("request failed")}
 async function rpc(method,params){let last;for(let a=0;a<5;a++){for(let j=0;j<RPCS.length;j++){const idx=(rpcIdx+j)%RPCS.length;try{const d=await fetchJ(RPCS[idx],{method:"POST",timeout:15000,headers:{"content-type":"application/json"},body:JSON.stringify({jsonrpc:"2.0",id:1,method,params})},1);if(d.error)throw Error(JSON.stringify(d.error));rpcIdx=idx;return d.result}catch(e){last=e}}await sleep(500*(a+1))}throw last}
 async function latest(){return parseInt(await rpc("eth_blockNumber",[]),16)}async function blockTs(n){const b=await rpc("eth_getBlockByNumber",["0x"+n.toString(16),false]);return parseInt(b.timestamp,16)}async function findBlock(ts,hi){let lo=1;while(lo<hi){const m=Math.floor((lo+hi)/2);if(await blockTs(m)<ts)lo=m+1;else hi=m}return lo}
@@ -410,7 +422,52 @@ function cleanupDatabase(){
   }
 }
 
-function dashboardRows(){return db.prepare(`WITH linked AS(SELECT ag.game_key,ag.event_slug,ag.title,ag.start_time,cl.combo_id FROM active_games ag JOIN active_game_markets gm ON gm.game_key=ag.game_key JOIN combo_legs cl ON cl.condition_id=gm.condition_id GROUP BY ag.game_key,cl.combo_id),agg AS(SELECT l.game_key,l.event_slug,l.title,l.start_time,COUNT(DISTINCT l.combo_id) combo_count,COUNT(DISTINCT p.wallet) wallet_count,COUNT(p.position_id) position_count,SUM(CASE WHEN (p.resolved_at IS NULL OR p.resolved_at='') AND p.shares>0.0001 THEN p.entry_cost ELSE 0 END) open_entry FROM linked l LEFT JOIN combo_positions p ON p.combo_id=l.combo_id GROUP BY l.game_key) SELECT * FROM agg ORDER BY open_entry DESC,combo_count DESC`).all()}
+function dashboardRows(){
+  return db.prepare(`
+    WITH linked AS(
+      SELECT
+        ag.game_key,
+        cl.combo_id
+      FROM active_games ag
+      JOIN active_game_markets gm ON gm.game_key=ag.game_key
+      JOIN combo_legs cl ON cl.condition_id=gm.condition_id
+      GROUP BY ag.game_key,cl.combo_id
+    ),
+    comboagg AS(
+      SELECT
+        l.game_key,
+        COUNT(DISTINCT l.combo_id) combo_count,
+        COUNT(DISTINCT p.wallet) wallet_count,
+        COUNT(p.position_id) position_count,
+        COALESCE(SUM(
+          CASE
+            WHEN (p.resolved_at IS NULL OR p.resolved_at='')
+             AND p.shares>0.0001
+            THEN p.entry_cost
+            ELSE 0
+          END
+        ),0) open_entry
+      FROM linked l
+      LEFT JOIN combo_positions p ON p.combo_id=l.combo_id
+      GROUP BY l.game_key
+    )
+    SELECT
+      ag.game_key,
+      ag.event_slug,
+      ag.title,
+      ag.start_time,
+      COALESCE(c.combo_count,0) combo_count,
+      COALESCE(c.wallet_count,0) wallet_count,
+      COALESCE(c.position_count,0) position_count,
+      COALESCE(c.open_entry,0) open_entry
+    FROM active_games ag
+    LEFT JOIN comboagg c ON c.game_key=ag.game_key
+    ORDER BY
+      COALESCE(c.open_entry,0) DESC,
+      COALESCE(c.combo_count,0) DESC,
+      ag.start_time ASC
+  `).all()
+}
 async function dashboardJob(id,source="manual"){
   const hardDeadline=Date.now()+8*60*1000;
   const checkDeadline=()=>{if(Date.now()>hardDeadline)throw new Error("Dashboard excedeu o limite de 8 minutos.");};
@@ -430,10 +487,8 @@ async function dashboardJob(id,source="manual"){
   try{
     setP(id,{status:"running",message:source==="auto"?"Auto-refresh: a atualizar jogos CS2 ativos...":"A atualizar jogos CS2 ativos..."});
     const activeInfo=await refreshActive(p=>{
-      setP(id,{
-        status:"running",
-        message:`Jogos CS2 ${p.done}/${p.total} · ${p.markets} mercados · ${p.failed} falhas`
-      });
+      const msg=`Jogos CS2 ${p.done}/${p.total} · ${p.markets} mercados · ${p.failed} falhas`;
+      setP(id,{status:"running",phase:"games",message:msg});
     });
     cleanupDatabase();
     if(!activeInfo.markets){
@@ -450,13 +505,19 @@ async function dashboardJob(id,source="manual"){
       lo++;
     }
 
-    setP(id,{status:"running",message:"A procurar novas wallets Combo..."});
+    setP(id,{status:"running",phase:"blockchain",message:"A procurar novas wallets Combo..."});
+    console.log(`Dashboard blockchain: blocos ${lo} -> ${hi}`);
     checkDeadline();
     const sc=await scanLogs(
       lo,
       hi,
-      p=>setP(id,{status:"running",message:`Blockchain ${p.done}/${p.total} · ${p.wallets} wallets`,...p})
+      p=>{
+        const msg=`Blockchain ${p.done}/${p.total} · ${p.wallets} wallets · ${p.logs} logs`;
+        setP(id,{status:"running",phase:"blockchain",message:msg,...p});
+        if(p.done===1 || p.done%25===0 || p.done===p.total)console.log(msg);
+      }
     );
+    console.log(`Dashboard blockchain concluído: ${sc.wallets.length} wallets · ${sc.logs} logs`);
 
     const known=db.prepare(
       "SELECT wallet FROM dashboard_match_wallets UNION SELECT wallet FROM tracked_matches"
@@ -464,7 +525,8 @@ async function dashboardJob(id,source="manual"){
 
     const wallets=[...new Set([...sc.wallets,...known])];
 
-    setP(id,{status:"running",message:`A atualizar ${wallets.length} wallets (novas + relevantes)...`});
+    setP(id,{status:"running",phase:"wallets",message:`A atualizar ${wallets.length} wallets (novas + relevantes)...`});
+    console.log(`Dashboard wallets: ${wallets.length} para analisar`);
 
     checkDeadline();
     await mapPool(
@@ -487,7 +549,11 @@ async function dashboardJob(id,source="manual"){
         if(matched)db.prepare("INSERT OR REPLACE INTO dashboard_match_wallets(wallet,last_match_utc) VALUES(?,?)").run(w,now());
         return matched;
       },
-      p=>setP(id,{status:"running",message:`Wallets ${p.done}/${p.total}`,...p})
+      p=>{
+        const msg=`Wallets ${p.done}/${p.total} · matches ${p.hits}`;
+        setP(id,{status:"running",phase:"wallets",message:msg,...p});
+        if(p.done===1 || p.done%25===0 || p.done===p.total)console.log(msg);
+      }
     );
 
     q.setMeta.run("dashboard_last_block",String(hi));
@@ -500,6 +566,7 @@ async function dashboardJob(id,source="manual"){
     autoState.lastNewWallets=Math.max(0,walletsAfter-walletsBefore);
     autoState.lastRows=rows.length;
     autoState.lastFinished=now();
+    autoState.phase="done";
 
     setP(id,{
       status:"done",
@@ -588,6 +655,6 @@ dbBytes:(()=>{try{return fs.statSync(DB_PATH).size}catch{return 0}})(),
 auto:autoState
 });
 if(req.method==="GET"&&u.pathname==="/api/dashboard/auto")return json(res,200,{auto:autoState});if(req.method==="POST"&&u.pathname==="/api/track"){const b=await body(req),id=jid();setP(id,{status:"queued",message:"A iniciar..."});trackJob(id,b.input);return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/tracked")return json(res,200,{rows:db.prepare("SELECT slug,title,start_time,last_run_utc FROM tracked_games ORDER BY last_run_utc DESC").all()});if(req.method==="POST"&&u.pathname==="/api/dashboard/refresh"){const id=jid();setP(id,{status:"queued",message:"A iniciar..."});dashboardJob(id,"manual");return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/dashboard")return json(res,200,{rows:dashboardRows()});if(req.method==="GET"&&u.pathname.startsWith("/api/jobs/"))return json(res,200,progress.get(u.pathname.split("/").pop())||{status:"unknown"});let f=u.pathname==="/"?"index.html":u.pathname.replace(/^\/+/,"");const fp=path.join(pub,f);if(!fp.startsWith(pub)||!fs.existsSync(fp))return json(res,404,{error:"not found"});const ext=path.extname(fp),types={".html":"text/html; charset=utf-8",".css":"text/css; charset=utf-8",".js":"text/javascript; charset=utf-8"};res.writeHead(200,{"content-type":types[ext]||"application/octet-stream","cache-control":"no-store"});res.end(fs.readFileSync(fp))}catch(e){json(res,500,{error:String(e.message||e)})}}).listen(PORT,HOST,()=>{
-console.log(`\nCS2 Combo Tracker ONLINE v9 PROGRESS: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos | v9 progress\n`);
+console.log(`\nCS2 Combo Tracker ONLINE v10 LIVE DASHBOARD: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos | v9 progress\n`);
 startDashboardAuto();
 });
