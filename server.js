@@ -261,7 +261,7 @@ async function body(req){
 }
 
 const jid=()=>`${Date.now()}_${Math.random().toString(36).slice(2,9)}`;
-const pub=path.join(BASE,"public");
+const pub=BASE;
 http.createServer(async(req,res)=>{try{const u=new URL(req.url,`http://${req.headers.host||"localhost"}`);
 if(req.method==="GET"&&u.pathname==="/login")return text(res,200,fs.readFileSync(path.join(pub,"login.html")),"text/html; charset=utf-8");
 if(req.method==="POST"&&u.pathname==="/api/login"){const payload=await body(req);const user=String(payload.user||""),pass=String(payload.password||"");const ua=Buffer.from(user),ub=Buffer.from(APP_USER),pa=Buffer.from(pass),pb=Buffer.from(APP_PASSWORD);const okUser=ua.length===ub.length&&crypto.timingSafeEqual(ua,ub),okPass=pa.length===pb.length&&crypto.timingSafeEqual(pa,pb);if(!okUser||!okPass)return json(res,401,{ok:false,error:"Credenciais inválidas"});setSessionCookie(res,user);return json(res,200,{ok:true})}
