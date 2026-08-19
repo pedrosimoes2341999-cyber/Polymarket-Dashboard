@@ -38,7 +38,7 @@ let autoState={
   lastRows:0
 };
 
-const db=new DatabaseSync(DB_PATH);db.exec(`PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;
+const db=new DatabaseSync(DB_PATH);db.exec(`PRAGMA journal_mode=DELETE;PRAGMA synchronous=NORMAL;PRAGMA temp_store=MEMORY;
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS wallets(wallet TEXT PRIMARY KEY,first_seen_utc TEXT,last_seen_utc TEXT);
 CREATE TABLE IF NOT EXISTS combo_positions(wallet TEXT,combo_id TEXT,position_id TEXT,entry_cost REAL DEFAULT 0,total_cost REAL DEFAULT 0,current_value REAL DEFAULT 0,shares REAL DEFAULT 0,status TEXT,first_entry_at TEXT,resolved_at TEXT,updated_at TEXT,fetched_at TEXT,PRIMARY KEY(wallet,combo_id,position_id));
@@ -89,6 +89,70 @@ const before=new Set(db.prepare("SELECT combo_id FROM tracked_combo_seen WHERE s
 const knownMatch=db.prepare("SELECT wallet FROM tracked_matches WHERE slug=?").all(slug).map(r=>r.wallet);setP(id,{status:"running",message:`Activity: ${newCand.length} novas + ${knownMatch.length} wallets conhecidas`});const actWallets=[...new Set([...newCand,...knownMatch])];await mapPool(actWallets,12,w=>refreshActivityWallet(w,target,slug),p=>setP(id,{status:"running",message:`Activity ${p.done}/${p.total}`,...p}));const matches=db.prepare("SELECT wallet FROM tracked_matches WHERE slug=?").all(slug).map(r=>r.wallet);setP(id,{status:"running",message:`Positions: ${matches.length} wallets relevantes`});await mapPool(matches,14,w=>refreshPositionsWallet(w,target,slug),p=>setP(id,{status:"running",message:`Positions ${p.done}/${p.total}`,...p}));db.prepare("UPDATE tracked_games SET last_scanned_block=?,last_run_utc=? WHERE slug=?").run(hi,now(),slug);const result=trackedResult(slug,main,target),after=new Set(result.combos.map(c=>c.combo_id));result.newCombos=[...after].filter(x=>!before.has(x)).length;result.incremental=!first;result.newCandidateWallets=newCand.length;setP(id,{status:"done",message:`Concluído: ${result.combos.length} combos · ${result.newCombos} novas`,result})}catch(e){setP(id,{status:"error",message:String(e.message||e)})}}
 async function activeCS2(){const found=new Map();for(const query of["CS2","Counter-Strike 2","Counter Strike"]){for(let page=1;page<=5;page++){const u=new URL(`${GAMMA}/public-search`);u.searchParams.set("q",query);u.searchParams.set("limit_per_type","50");u.searchParams.set("page",String(page));u.searchParams.set("keep_closed_markets","0");u.searchParams.set("search_profiles","false");u.searchParams.set("search_tags","false");let d;try{d=await fetchJ(u.toString(),{timeout:10000},3)}catch{break}for(const e of d.events||[]){const s=String(e.slug||""),t=String(e.title||"").toLowerCase();if(s&&e.closed!==true&&(s.toLowerCase().startsWith("cs2-")||t.includes("counter strike")||t.includes("counter-strike")))found.set(s,e)}if(!(d.pagination||{}).hasMore)break}}return[...found.values()]}
 async function refreshActive(){const events=await activeCS2(),ts=now();db.exec("DELETE FROM active_games;DELETE FROM active_game_markets;");for(const e0 of events){let e=e0;if(!e.markets){try{e=await eventBySlug(e.slug)}catch{}}const key=String(e.id?`event:${e.id}`:`slug:${e.slug}`);db.prepare("INSERT OR REPLACE INTO active_games(game_key,event_id,event_slug,title,start_time,refreshed_at) VALUES(?,?,?,?,?,?)").run(key,String(e.id||""),String(e.slug||""),String(e.title||""),String(e.startDate||e.endDate||""),ts);for(const m of marketRows([e]))db.prepare("INSERT OR REPLACE INTO active_game_markets(game_key,condition_id,market_slug,market_title) VALUES(?,?,?,?)").run(key,m.condition_id,m.market_slug,m.market_title)}return events.length}
+
+function cleanupDatabase(){
+  try{
+    // Keep only combos that are relevant to:
+    // 1) currently active CS2 game markets, or
+    // 2) markets belonging to a game explicitly tracked by the user.
+    //
+    // tracked_combo_seen is also preserved, even if a leg record is temporarily missing.
+    db.exec(`
+      DELETE FROM combo_activity
+      WHERE combo_id NOT IN (
+        SELECT DISTINCT cl.combo_id
+        FROM combo_legs cl
+        WHERE cl.condition_id IN (
+          SELECT condition_id FROM active_game_markets
+          UNION
+          SELECT condition_id FROM tracked_markets
+        )
+        UNION
+        SELECT combo_id FROM tracked_combo_seen
+      );
+
+      DELETE FROM combo_positions
+      WHERE combo_id NOT IN (
+        SELECT DISTINCT cl.combo_id
+        FROM combo_legs cl
+        WHERE cl.condition_id IN (
+          SELECT condition_id FROM active_game_markets
+          UNION
+          SELECT condition_id FROM tracked_markets
+        )
+        UNION
+        SELECT combo_id FROM tracked_combo_seen
+      );
+
+      DELETE FROM combo_legs
+      WHERE combo_id NOT IN (
+        SELECT DISTINCT combo_id FROM combo_positions
+        UNION
+        SELECT DISTINCT combo_id FROM combo_activity
+        UNION
+        SELECT combo_id FROM tracked_combo_seen
+      );
+
+      DELETE FROM wallets
+      WHERE wallet NOT IN (
+        SELECT DISTINCT wallet FROM combo_positions
+        UNION
+        SELECT DISTINCT wallet FROM combo_activity
+        UNION
+        SELECT wallet FROM tracked_matches
+        UNION
+        SELECT wallet FROM tracked_candidates
+        UNION
+        SELECT wallet FROM dashboard_match_wallets
+      );
+    `);
+
+    try{ db.exec("PRAGMA optimize;"); }catch{}
+  }catch(e){
+    console.error("Cleanup DB falhou:", e?.message || e);
+  }
+}
+
 function dashboardRows(){return db.prepare(`WITH linked AS(SELECT ag.game_key,ag.event_slug,ag.title,ag.start_time,cl.combo_id FROM active_games ag JOIN active_game_markets gm ON gm.game_key=ag.game_key JOIN combo_legs cl ON cl.condition_id=gm.condition_id GROUP BY ag.game_key,cl.combo_id),agg AS(SELECT l.game_key,l.event_slug,l.title,l.start_time,COUNT(DISTINCT l.combo_id) combo_count,COUNT(DISTINCT p.wallet) wallet_count,COUNT(p.position_id) position_count,SUM(CASE WHEN (p.resolved_at IS NULL OR p.resolved_at='') AND p.shares>0.0001 THEN p.entry_cost ELSE 0 END) open_entry FROM linked l LEFT JOIN combo_positions p ON p.combo_id=l.combo_id GROUP BY l.game_key) SELECT * FROM agg ORDER BY open_entry DESC,combo_count DESC`).all()}
 async function dashboardJob(id,source="manual"){
   if(dashboardRunning){
@@ -107,6 +171,7 @@ async function dashboardJob(id,source="manual"){
   try{
     setP(id,{status:"running",message:source==="auto"?"Auto-refresh: a atualizar jogos CS2 ativos...":"A atualizar jogos CS2 ativos..."});
     await refreshActive();
+    cleanupDatabase();
 
     const hi=await latest();
     let lo=Number(q.getMeta.get("dashboard_last_block")?.value||0);
@@ -145,6 +210,16 @@ async function dashboardJob(id,source="manual"){
           const cid=String(c.combo_condition_id||c.combo_position_id||"");
           if(!cid)continue;
 
+          // CRITICAL v6 optimization:
+          // Do NOT persist every combo held by the wallet.
+          // Only persist a combo when at least one leg belongs to an active CS2 game.
+          const hits=(c.legs||[]).some(l=>
+            db.prepare("SELECT 1 FROM active_game_markets WHERE condition_id=? LIMIT 1").get(legCid(l))
+          );
+
+          if(!hits)continue;
+
+          matched=true;
           saveLegs(cid,c.legs||[]);
 
           q.pos.run(
@@ -161,12 +236,6 @@ async function dashboardJob(id,source="manual"){
             String(c.updated_at||""),
             now()
           );
-
-          const hits=(c.legs||[]).some(l=>
-            db.prepare("SELECT 1 FROM active_game_markets WHERE condition_id=? LIMIT 1").get(legCid(l))
-          );
-
-          if(hits)matched=true;
         }
 
         if(matched){
@@ -180,6 +249,7 @@ async function dashboardJob(id,source="manual"){
       p=>setP(id,{status:"running",message:`Wallets ${p.done}/${p.total}`,...p})
     );
 
+    cleanupDatabase();
     const rows=dashboardRows();
     const combosAfter=Number(db.prepare("SELECT COUNT(DISTINCT combo_id) n FROM combo_positions").get().n||0);
     const walletsAfter=Number(db.prepare("SELECT COUNT(*) n FROM dashboard_match_wallets").get().n||0);
@@ -272,9 +342,10 @@ wallets:db.prepare("SELECT COUNT(*) n FROM wallets").get().n,
 combos:db.prepare("SELECT COUNT(DISTINCT combo_id) n FROM combo_positions").get().n,
 positions:db.prepare("SELECT COUNT(*) n FROM combo_positions").get().n,
 tracked:db.prepare("SELECT COUNT(*) n FROM tracked_games").get().n,
+dbBytes:(()=>{try{return fs.statSync(DB_PATH).size}catch{return 0}})(),
 auto:autoState
 });
 if(req.method==="GET"&&u.pathname==="/api/dashboard/auto")return json(res,200,{auto:autoState});if(req.method==="POST"&&u.pathname==="/api/track"){const b=await body(req),id=jid();setP(id,{status:"queued",message:"A iniciar..."});trackJob(id,b.input);return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/tracked")return json(res,200,{rows:db.prepare("SELECT slug,title,start_time,last_run_utc FROM tracked_games ORDER BY last_run_utc DESC").all()});if(req.method==="POST"&&u.pathname==="/api/dashboard/refresh"){const id=jid();setP(id,{status:"queued",message:"A iniciar..."});dashboardJob(id,"manual");return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/dashboard")return json(res,200,{rows:dashboardRows()});if(req.method==="GET"&&u.pathname.startsWith("/api/jobs/"))return json(res,200,progress.get(u.pathname.split("/").pop())||{status:"unknown"});let f=u.pathname==="/"?"index.html":u.pathname.replace(/^\/+/,"");const fp=path.join(pub,f);if(!fp.startsWith(pub)||!fs.existsSync(fp))return json(res,404,{error:"not found"});const ext=path.extname(fp),types={".html":"text/html; charset=utf-8",".css":"text/css; charset=utf-8",".js":"text/javascript; charset=utf-8"};res.writeHead(200,{"content-type":types[ext]||"application/octet-stream","cache-control":"no-store"});res.end(fs.readFileSync(fp))}catch(e){json(res,500,{error:String(e.message||e)})}}).listen(PORT,HOST,()=>{
-console.log(`\nCS2 Combo Tracker ONLINE v5: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos\n`);
+console.log(`\nCS2 Combo Tracker ONLINE v6 OPTIMIZED: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos\n`);
 startDashboardAuto();
 });

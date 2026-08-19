@@ -20,7 +20,8 @@ function renderAuto(auto){
 async function status(){
   try{
     const s=await api('/api/status');
-    $('#dbStatus').innerHTML=`<b>${fmt(s.combos)} combos indexadas</b><br>${fmt(s.wallets)} wallets · ${fmt(s.positions)} posições<br>${fmt(s.tracked)} jogos em tracking`;
+    const mb=(Number(s.dbBytes||0)/1024/1024).toFixed(1);
+    $('#dbStatus').innerHTML=`<b>${fmt(s.combos)} combos CS2 indexadas</b><br>${fmt(s.wallets)} wallets · ${fmt(s.positions)} posições<br>${fmt(s.tracked)} jogos em tracking · DB ${mb} MB`;
     renderAuto(s.auto);
   }catch{
     $('#dbStatus').textContent='Servidor offline'
