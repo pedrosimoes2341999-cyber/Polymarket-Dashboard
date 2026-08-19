@@ -20,7 +20,7 @@ const CONTRACTS=[
 "0xe3333700cA9d93003F00f0F71f8515005F6c00Aa","0xa1200000d0002264C9a1698e001292D00E1b00af"].map(x=>x.toLowerCase());
 const IGNORE=new Set([...CONTRACTS,"0x0000000000000000000000000000000000000000"]);
 const LOG_CHUNK=3500,TOPIC_FALLBACK_MIN=25,TX_FALLBACK_MAX=3000;
-const TRACK_ACTIVITY_CONCURRENCY=10,TRACK_POSITION_CONCURRENCY=10,DASHBOARD_ACTIVITY_CONCURRENCY=10,DASHBOARD_POSITION_CONCURRENCY=10;
+const TRACK_ACTIVITY_CONCURRENCY=16,TRACK_POSITION_CONCURRENCY=16,DASHBOARD_ACTIVITY_CONCURRENCY=16,DASHBOARD_POSITION_CONCURRENCY=16;
 const MAX_COMBO_PAGES_PER_WALLET=100;
 const MAX_INITIAL_SCAN_DAYS=30;
 const PRE_EVENT_MARGIN_HOURS=4;
@@ -261,8 +261,8 @@ function startMs(events){
 }
 
 const ENRICH_CACHE=new Map();
-const ENRICH_TTL=10*60*1000;
-const ENRICH_CONCURRENCY=5;
+const ENRICH_TTL=30*60*1000;
+const ENRICH_CONCURRENCY=12;
 function eNum(v){const n=Number(v);return Number.isFinite(n)?n:0}
 function eLow(v){return String(v||"").toLowerCase()}
 function eGet(k){const x=ENRICH_CACHE.get(k);return x&&Date.now()-x.t<ENRICH_TTL?x.v:undefined}
@@ -282,10 +282,26 @@ function eBest(rows,cid,outcome){
   const a=(rows||[]).filter(x=>eLow(x.conditionId||x.condition_id)===eLow(cid));
   return a.find(x=>!outcome||eLow(x.outcome)===eLow(outcome))||a[0]||null
 }
+async function eCurrentAll(wallet){
+  const k=`ca:${eLow(wallet)}`,q=eGet(k);
+  if(q!==undefined)return q;
+
+  let all=[];
+  for(let off=0;off<=5000;off+=500){
+    const rows=await eFetch(
+      `https://data-api.polymarket.com/positions?user=${encodeURIComponent(wallet)}&sizeThreshold=0&limit=500&offset=${off}`
+    );
+    if(!Array.isArray(rows))break;
+    all.push(...rows);
+    if(rows.length<500)break;
+  }
+
+  return eSet(k,all);
+}
+
 async function eCurrent(wallet,cid,outcome){
-  const k=`c:${eLow(wallet)}:${eLow(cid)}:${eLow(outcome)}`,q=eGet(k);if(q!==undefined)return q;
-  const rows=await eFetch(`https://data-api.polymarket.com/positions?user=${encodeURIComponent(wallet)}&market=${encodeURIComponent(cid)}&sizeThreshold=0&limit=500`);
-  return eSet(k,eBest(Array.isArray(rows)?rows:[],cid,outcome))
+  const rows=await eCurrentAll(wallet);
+  return eBest(rows,cid,outcome);
 }
 async function eClosed(wallet,cid,outcome){
   const k=`x:${eLow(wallet)}:${eLow(cid)}:${eLow(outcome)}`,q=eGet(k);if(q!==undefined)return q;
@@ -302,45 +318,110 @@ async function eMarket(wallet,cid,outcome){
   const rows=[];if(Array.isArray(groups))for(const g of groups)if(Array.isArray(g.positions))rows.push(...g.positions);
   return eSet(k,eBest(rows,cid,outcome))
 }
-async function eWallet(w,c){
-  let best=null;
-  for(const leg of (c.legs||[]).filter(l=>l.condition_id)){
-    const [cur,mkt,closed]=await Promise.all([eCurrent(w.wallet,leg.condition_id,leg.outcome),eMarket(w.wallet,leg.condition_id,leg.outcome),eClosed(w.wallet,leg.condition_id,leg.outcome)]);
-    if(cur||mkt||closed){best={leg,cur,mkt,closed};if(cur)break}
+async function eWallet(w,c,targetSet=null){
+  const allLegs=(c.legs||[]).filter(l=>l.condition_id);
+  const targetLegs=targetSet
+    ? allLegs.filter(l=>targetSet.has(eLow(l.condition_id)))
+    : [];
+
+  // For Tracking, the user wants the entry associated with the selection of THIS game.
+  // This avoids querying every other leg in the combo.
+  const legs=targetLegs.length?targetLegs:allLegs;
+
+  // One wallet-wide current-position request, reused across all target legs.
+  const currentRows=await eCurrentAll(w.wallet);
+
+  for(const leg of legs){
+    const cur=eBest(currentRows,leg.condition_id,leg.outcome);
+    if(cur){
+      const avg=eNum(cur.avgPrice);
+      const size=eNum(cur.size??w.shares);
+      const initial=eNum(cur.initialValue)||(avg&&size?avg*size:0);
+      const bought=eNum(cur.totalBought);
+      const hist=initial||(avg&&bought?avg*bought:0);
+      const realized=eNum(cur.realizedPnl);
+      const unreal=eNum(cur.cashPnl);
+
+      return {
+        ...w,
+        enriched:true,
+        data_source:"CURRENT",
+        matched_condition_id:leg.condition_id,
+        matched_outcome:leg.outcome||"",
+        avg_price:avg,
+        initial_value:initial,
+        historical_entry:hist,
+        total_bought:bought,
+        current_value:eNum(cur.currentValue??w.current_value),
+        shares:size,
+        realized_pnl:realized,
+        unrealized_pnl:unreal,
+        total_pnl:realized+unreal,
+        current_price:eNum(cur.curPrice),
+        entry_cost:eNum(w.entry_cost)||hist,
+        total_cost:eNum(w.total_cost)||hist,
+        position_id:w.position_id||cur.asset||"",
+        status:"Aberta"
+      };
+    }
   }
-  if(!best)return{...w,enriched:false,data_source:w.source||"ACTIVITY"};
-  const {leg,cur,mkt,closed}=best,src=cur||mkt||closed;
-  const avg=eNum(src.avgPrice),size=eNum(cur?.size??mkt?.size??w.shares);
-  const initial=eNum(cur?.initialValue)||(avg&&size?avg*size:0);
-  const bought=eNum(cur?.totalBought??mkt?.totalBought??closed?.totalBought);
-  const hist=initial||(avg&&bought?avg*bought:0);
-  const realized=eNum(cur?.realizedPnl??mkt?.realizedPnl??closed?.realizedPnl);
-  const unreal=eNum(cur?.cashPnl??mkt?.cashPnl);
-  return{...w,enriched:true,data_source:cur?"CURRENT":(mkt?"MARKET ALL":"CLOSED"),
-    matched_condition_id:leg.condition_id,matched_outcome:leg.outcome||"",
-    avg_price:avg,initial_value:initial,historical_entry:hist,total_bought:bought,
-    current_value:eNum(cur?.currentValue??mkt?.currentValue??w.current_value),
-    shares:size,realized_pnl:realized,unrealized_pnl:unreal,
-    total_pnl:eNum(mkt?.totalPnl)||(realized+unreal),
-    current_price:eNum(cur?.curPrice??mkt?.currPrice??closed?.curPrice),
-    entry_cost:eNum(w.entry_cost)||hist,total_cost:eNum(w.total_cost)||hist,
-    position_id:w.position_id||src.asset||"",status:cur?"Aberta":"Fechada"}
+
+  // Only unresolved target legs hit the slower historical endpoints.
+  // Market ALL + Closed are requested in parallel.
+  for(const leg of legs){
+    const [mkt,closed]=await Promise.all([
+      eMarket(w.wallet,leg.condition_id,leg.outcome),
+      eClosed(w.wallet,leg.condition_id,leg.outcome)
+    ]);
+
+    const src=mkt||closed;
+    if(!src)continue;
+
+    const avg=eNum(src.avgPrice);
+    const size=eNum(mkt?.size??w.shares);
+    const initial=(avg&&size?avg*size:0);
+    const bought=eNum(mkt?.totalBought??closed?.totalBought);
+    const hist=initial||(avg&&bought?avg*bought:0);
+    const realized=eNum(mkt?.realizedPnl??closed?.realizedPnl);
+    const unreal=eNum(mkt?.cashPnl);
+
+    return {
+      ...w,
+      enriched:true,
+      data_source:mkt?"MARKET ALL":"CLOSED",
+      matched_condition_id:leg.condition_id,
+      matched_outcome:leg.outcome||"",
+      avg_price:avg,
+      initial_value:initial,
+      historical_entry:hist,
+      total_bought:bought,
+      current_value:eNum(mkt?.currentValue??w.current_value),
+      shares:size,
+      realized_pnl:realized,
+      unrealized_pnl:unreal,
+      total_pnl:eNum(mkt?.totalPnl)||(realized+unreal),
+      current_price:eNum(mkt?.currPrice??closed?.curPrice),
+      entry_cost:eNum(w.entry_cost)||hist,
+      total_cost:eNum(w.total_cost)||hist,
+      position_id:w.position_id||src.asset||"",
+      status:"Fechada"
+    };
+  }
+
+  return {...w,enriched:false,data_source:w.source||"ACTIVITY"};
 }
-async function enrichTrackedResult(result){
+async function enrichTrackedResult(result,targetSet=null){
   if(!result?.combos)return result;
 
-  for(const c of result.combos){
+  await ePool(result.combos,Math.min(6,result.combos.length||1),async c=>{
     c.wallet_list=await ePool(
       c.wallet_list||[],
       ENRICH_CONCURRENCY,
       async w=>{
-        const x=await eWallet(w,c);
-
+        const x=await eWallet(w,c,targetSet);
         const confirmedEntry=eNum(x.entry_cost);
         const activity=eNum(x.activity_amount);
 
-        // "Valor colocado" prioritizes a real reconstructed entry/initial value.
-        // If unavailable, use Activity Amount as a fallback estimate and mark it clearly.
         if(confirmedEntry>0){
           x.placed_amount=confirmedEntry;
           x.placed_source="CONFIRMADO";
@@ -351,7 +432,6 @@ async function enrichTrackedResult(result){
           x.placed_amount=0;
           x.placed_source="SEM_DADOS";
         }
-
         return x;
       }
     );
@@ -359,18 +439,14 @@ async function enrichTrackedResult(result){
     c.total_placed_confirmed=c.wallet_list
       .filter(w=>w.placed_source==="CONFIRMADO")
       .reduce((a,w)=>a+eNum(w.placed_amount),0);
-
     c.total_placed_estimated=c.wallet_list
       .filter(w=>w.placed_source==="ESTIMADO_ACTIVITY")
       .reduce((a,w)=>a+eNum(w.placed_amount),0);
-
     c.total_placed=c.wallet_list.reduce((a,w)=>a+eNum(w.placed_amount),0);
-
     c.wallets_confirmed=c.wallet_list.filter(w=>w.placed_source==="CONFIRMADO").length;
     c.wallets_estimated=c.wallet_list.filter(w=>w.placed_source==="ESTIMADO_ACTIVITY").length;
-
     c.wallet_list.sort((a,b)=>eNum(b.placed_amount)-eNum(a.placed_amount));
-  }
+  });
 
   result.total_placed=result.combos.reduce((a,c)=>a+eNum(c.total_placed),0);
   result.total_placed_confirmed=result.combos.reduce((a,c)=>a+eNum(c.total_placed_confirmed),0);
@@ -582,7 +658,9 @@ async function trackJob(id,input){
 
     setP(id,{status:"running",message:"[3/6] Novos logs Combo..."});
 
-    const sc=await scanLogs(lo,hi,p=>{
+    const sc=lo>hi
+      ? {wallets:[],txs:[],logs:0}
+      : await scanLogs(lo,hi,p=>{
       const msg=`Logs ${p.done}/${p.total} · ${p.logs} eventos · ${p.wallets} wallets`;
       setP(id,{status:"running",message:msg,...p});
       if(p.done===1||p.done%10===0||p.done===p.total)console.log(`TRACK ${slug}: ${msg}`);
@@ -673,7 +751,7 @@ async function trackJob(id,input){
       }
     );
 
-    const result=await enrichTrackedResult(trackedResult(slug,main,target));
+    const result=await enrichTrackedResult(trackedResult(slug,main,target),new Set([...target].map(eLow)));
     const after=new Set(result.combos.map(c=>c.combo_id));
 
     result.newCombos=[...after].filter(x=>!beforeCombos.has(x)).length;
@@ -1267,6 +1345,6 @@ dbBytes:(()=>{try{return fs.statSync(DB_PATH).size}catch{return 0}})(),
 auto:autoState
 });
 if(req.method==="GET"&&u.pathname==="/api/dashboard/auto")return json(res,200,{auto:autoState});if(req.method==="POST"&&u.pathname==="/api/track"){const b=await body(req),id=jid();setP(id,{status:"queued",message:"A iniciar..."});trackJob(id,b.input);return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/tracked")return json(res,200,{rows:db.prepare("SELECT slug,title,start_time,last_run_utc FROM tracked_games ORDER BY last_run_utc DESC").all()});if(req.method==="POST"&&u.pathname==="/api/dashboard/refresh"){const id=jid();setP(id,{status:"queued",message:"A iniciar..."});dashboardJob(id,"manual");return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/dashboard")return json(res,200,{rows:dashboardRows()});if(req.method==="GET"&&u.pathname.startsWith("/api/jobs/"))return json(res,200,progress.get(u.pathname.split("/").pop())||{status:"unknown"});let f=u.pathname==="/"?"index.html":u.pathname.replace(/^\/+/,"");const fp=path.join(pub,f);if(!fp.startsWith(pub)||!fs.existsSync(fp))return json(res,404,{error:"not found"});const ext=path.extname(fp),types={".html":"text/html; charset=utf-8",".css":"text/css; charset=utf-8",".js":"text/javascript; charset=utf-8"};res.writeHead(200,{"content-type":types[ext]||"application/octet-stream","cache-control":"no-store"});res.end(fs.readFileSync(fp))}catch(e){json(res,500,{error:String(e.message||e)})}}).listen(PORT,HOST,()=>{
-console.log(`\nCS2 Combo Tracker ONLINE v17 TOTAL PLACED: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos | v9 progress\n`);
+console.log(`\nCS2 Combo Tracker ONLINE v20 TURBO CACHE: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos | v9 progress\n`);
 startDashboardAuto();
 });
