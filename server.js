@@ -259,6 +259,86 @@ function startMs(events){
   start-=PRE_EVENT_MARGIN_HOURS*3600e3;
   return Math.max(start,nowMs-MAX_INITIAL_SCAN_DAYS*86400e3);
 }
+
+const ENRICH_CACHE=new Map();
+const ENRICH_TTL=10*60*1000;
+const ENRICH_CONCURRENCY=5;
+function eNum(v){const n=Number(v);return Number.isFinite(n)?n:0}
+function eLow(v){return String(v||"").toLowerCase()}
+function eGet(k){const x=ENRICH_CACHE.get(k);return x&&Date.now()-x.t<ENRICH_TTL?x.v:undefined}
+function eSet(k,v){ENRICH_CACHE.set(k,{t:Date.now(),v});return v}
+async function eFetch(url){
+  try{
+    const r=await fetch(url,{headers:{accept:"application/json","user-agent":"cs2-combo-tracker/16"},signal:AbortSignal.timeout(15000)});
+    return r.ok?await r.json():null;
+  }catch{return null}
+}
+async function ePool(items,limit,fn){
+  const out=new Array(items.length);let next=0;
+  async function w(){while(true){const i=next++;if(i>=items.length)return;out[i]=await fn(items[i],i)}}
+  await Promise.all(Array.from({length:Math.min(limit,Math.max(1,items.length))},w));return out
+}
+function eBest(rows,cid,outcome){
+  const a=(rows||[]).filter(x=>eLow(x.conditionId||x.condition_id)===eLow(cid));
+  return a.find(x=>!outcome||eLow(x.outcome)===eLow(outcome))||a[0]||null
+}
+async function eCurrent(wallet,cid,outcome){
+  const k=`c:${eLow(wallet)}:${eLow(cid)}:${eLow(outcome)}`,q=eGet(k);if(q!==undefined)return q;
+  const rows=await eFetch(`https://data-api.polymarket.com/positions?user=${encodeURIComponent(wallet)}&market=${encodeURIComponent(cid)}&sizeThreshold=0&limit=500`);
+  return eSet(k,eBest(Array.isArray(rows)?rows:[],cid,outcome))
+}
+async function eClosed(wallet,cid,outcome){
+  const k=`x:${eLow(wallet)}:${eLow(cid)}:${eLow(outcome)}`,q=eGet(k);if(q!==undefined)return q;
+  let all=[];
+  for(let off=0;off<=100000;off+=50){
+    const rows=await eFetch(`https://data-api.polymarket.com/closed-positions?user=${encodeURIComponent(wallet)}&market=${encodeURIComponent(cid)}&limit=50&offset=${off}&sortBy=TIMESTAMP&sortDirection=DESC`);
+    if(!Array.isArray(rows))break;all.push(...rows);if(rows.length<50)break
+  }
+  return eSet(k,eBest(all,cid,outcome))
+}
+async function eMarket(wallet,cid,outcome){
+  const k=`m:${eLow(wallet)}:${eLow(cid)}:${eLow(outcome)}`,q=eGet(k);if(q!==undefined)return q;
+  const groups=await eFetch(`https://data-api.polymarket.com/v1/market-positions?market=${encodeURIComponent(cid)}&user=${encodeURIComponent(wallet)}&status=ALL&limit=500&sortBy=TOTAL_PNL&sortDirection=DESC`);
+  const rows=[];if(Array.isArray(groups))for(const g of groups)if(Array.isArray(g.positions))rows.push(...g.positions);
+  return eSet(k,eBest(rows,cid,outcome))
+}
+async function eWallet(w,c){
+  let best=null;
+  for(const leg of (c.legs||[]).filter(l=>l.condition_id)){
+    const [cur,mkt,closed]=await Promise.all([eCurrent(w.wallet,leg.condition_id,leg.outcome),eMarket(w.wallet,leg.condition_id,leg.outcome),eClosed(w.wallet,leg.condition_id,leg.outcome)]);
+    if(cur||mkt||closed){best={leg,cur,mkt,closed};if(cur)break}
+  }
+  if(!best)return{...w,enriched:false,data_source:w.source||"ACTIVITY"};
+  const {leg,cur,mkt,closed}=best,src=cur||mkt||closed;
+  const avg=eNum(src.avgPrice),size=eNum(cur?.size??mkt?.size??w.shares);
+  const initial=eNum(cur?.initialValue)||(avg&&size?avg*size:0);
+  const bought=eNum(cur?.totalBought??mkt?.totalBought??closed?.totalBought);
+  const hist=initial||(avg&&bought?avg*bought:0);
+  const realized=eNum(cur?.realizedPnl??mkt?.realizedPnl??closed?.realizedPnl);
+  const unreal=eNum(cur?.cashPnl??mkt?.cashPnl);
+  return{...w,enriched:true,data_source:cur?"CURRENT":(mkt?"MARKET ALL":"CLOSED"),
+    matched_condition_id:leg.condition_id,matched_outcome:leg.outcome||"",
+    avg_price:avg,initial_value:initial,historical_entry:hist,total_bought:bought,
+    current_value:eNum(cur?.currentValue??mkt?.currentValue??w.current_value),
+    shares:size,realized_pnl:realized,unrealized_pnl:unreal,
+    total_pnl:eNum(mkt?.totalPnl)||(realized+unreal),
+    current_price:eNum(cur?.curPrice??mkt?.currPrice??closed?.curPrice),
+    entry_cost:eNum(w.entry_cost)||hist,total_cost:eNum(w.total_cost)||hist,
+    position_id:w.position_id||src.asset||"",status:cur?"Aberta":"Fechada"}
+}
+async function enrichTrackedResult(result){
+  if(!result?.combos)return result;
+  for(const c of result.combos){
+    c.wallet_list=await ePool(c.wallet_list||[],ENRICH_CONCURRENCY,w=>eWallet(w,c));
+    c.open_entry=c.wallet_list.filter(w=>w.status==="Aberta").reduce((a,w)=>a+eNum(w.entry_cost),0);
+    c.current_value=c.wallet_list.reduce((a,w)=>a+eNum(w.current_value),0);
+    c.realized_pnl=c.wallet_list.reduce((a,w)=>a+eNum(w.realized_pnl),0);
+    c.unrealized_pnl=c.wallet_list.reduce((a,w)=>a+eNum(w.unrealized_pnl),0);
+    c.wallet_list.sort((a,b)=>eNum(b.entry_cost)-eNum(a.entry_cost)||eNum(b.activity_amount)-eNum(a.activity_amount))
+  }
+  return result
+}
+
 function trackedResult(slug,main,target){
   const ids=[...target];
   if(!ids.length)return{event:main,combos:[],newCombos:0};
@@ -553,7 +633,7 @@ async function trackJob(id,input){
       }
     );
 
-    const result=trackedResult(slug,main,target);
+    const result=await enrichTrackedResult(trackedResult(slug,main,target));
     const after=new Set(result.combos.map(c=>c.combo_id));
 
     result.newCombos=[...after].filter(x=>!beforeCombos.has(x)).length;
@@ -1147,6 +1227,6 @@ dbBytes:(()=>{try{return fs.statSync(DB_PATH).size}catch{return 0}})(),
 auto:autoState
 });
 if(req.method==="GET"&&u.pathname==="/api/dashboard/auto")return json(res,200,{auto:autoState});if(req.method==="POST"&&u.pathname==="/api/track"){const b=await body(req),id=jid();setP(id,{status:"queued",message:"A iniciar..."});trackJob(id,b.input);return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/tracked")return json(res,200,{rows:db.prepare("SELECT slug,title,start_time,last_run_utc FROM tracked_games ORDER BY last_run_utc DESC").all()});if(req.method==="POST"&&u.pathname==="/api/dashboard/refresh"){const id=jid();setP(id,{status:"queued",message:"A iniciar..."});dashboardJob(id,"manual");return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/dashboard")return json(res,200,{rows:dashboardRows()});if(req.method==="GET"&&u.pathname.startsWith("/api/jobs/"))return json(res,200,progress.get(u.pathname.split("/").pop())||{status:"unknown"});let f=u.pathname==="/"?"index.html":u.pathname.replace(/^\/+/,"");const fp=path.join(pub,f);if(!fp.startsWith(pub)||!fs.existsSync(fp))return json(res,404,{error:"not found"});const ext=path.extname(fp),types={".html":"text/html; charset=utf-8",".css":"text/css; charset=utf-8",".js":"text/javascript; charset=utf-8"};res.writeHead(200,{"content-type":types[ext]||"application/octet-stream","cache-control":"no-store"});res.end(fs.readFileSync(fp))}catch(e){json(res,500,{error:String(e.message||e)})}}).listen(PORT,HOST,()=>{
-console.log(`\nCS2 Combo Tracker ONLINE v15 ACTIVITY VALUES: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos | v9 progress\n`);
+console.log(`\nCS2 Combo Tracker ONLINE v16 ENRICHED POSITIONS: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos | v9 progress\n`);
 startDashboardAuto();
 });

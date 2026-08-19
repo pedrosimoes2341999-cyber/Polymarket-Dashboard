@@ -1,0 +1,5 @@
+v16 ENRICHED
+Substituir server.js e app.js. NÃO apagar /data nem fazer Wipe Volume.
+Cruza Current Positions + Market Positions ALL + Closed Positions + Activity.
+Valores sem fonte aparecem como —.
+Cache 10 min; concorrência 5.
