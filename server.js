@@ -148,7 +148,129 @@ async function trackJob(id,input){try{const slug=slugOf(input);setP(id,{status:"
 const tg=db.prepare("SELECT last_scanned_block FROM tracked_games WHERE slug=?").get(slug),hi=await latest();let lo=Number(tg?.last_scanned_block||0);const first=!lo;if(first)lo=await findBlock(Math.floor(startMs(events)/1000),hi);else lo++;
 const before=new Set(db.prepare("SELECT combo_id FROM tracked_combo_seen WHERE slug=?").all(slug).map(r=>r.combo_id));setP(id,{status:"running",message:first?"Primeira indexação on-chain...":"A procurar atividade nova..."});const sc=await scanLogs(lo,hi,p=>setP(id,{status:"running",message:`Blockchain ${p.done}/${p.total} · ${p.wallets} wallets`,...p}));let discovered=new Set(sc.wallets);if(discovered.size<TOPIC_FALLBACK_MIN&&sc.txs.length){setP(id,{status:"running",message:"Poucas wallets nos topics; fallback tx.from limitado..."});for(const w of await txFallback(sc.txs,(d,t,n)=>setP(id,{status:"running",message:`Fallback TX ${d}/${t} · ${n} wallets`})) )discovered.add(w)}const oldCand=new Set(db.prepare("SELECT wallet FROM tracked_candidates WHERE slug=?").all(slug).map(r=>r.wallet)),newCand=[...discovered].filter(w=>!oldCand.has(w));for(const w of discovered)db.prepare("INSERT OR IGNORE INTO tracked_candidates(slug,wallet) VALUES(?,?)").run(slug,w);
 const knownMatch=db.prepare("SELECT wallet FROM tracked_matches WHERE slug=?").all(slug).map(r=>r.wallet);setP(id,{status:"running",message:`Activity: ${newCand.length} novas + ${knownMatch.length} wallets conhecidas`});const actWallets=[...new Set([...newCand,...knownMatch])];await mapPool(actWallets,TRACK_ACTIVITY_CONCURRENCY,w=>refreshActivityWallet(w,target,slug),p=>setP(id,{status:"running",message:`Activity ${p.done}/${p.total}`,...p}));const matches=db.prepare("SELECT wallet FROM tracked_matches WHERE slug=?").all(slug).map(r=>r.wallet);setP(id,{status:"running",message:`Positions: ${matches.length} wallets relevantes`});await mapPool(matches,TRACK_POSITION_CONCURRENCY,w=>refreshPositionsWallet(w,target,slug),p=>setP(id,{status:"running",message:`Positions ${p.done}/${p.total}`,...p}));db.prepare("UPDATE tracked_games SET last_scanned_block=?,last_run_utc=? WHERE slug=?").run(hi,now(),slug);const result=trackedResult(slug,main,target),after=new Set(result.combos.map(c=>c.combo_id));result.newCombos=[...after].filter(x=>!before.has(x)).length;result.incremental=!first;result.newCandidateWallets=newCand.length;setP(id,{status:"done",message:`Concluído: ${result.combos.length} combos · ${result.newCombos} novas`,result})}catch(e){setP(id,{status:"error",message:String(e.message||e)})}}
-async function activeCS2(){const found=new Map();for(const query of["CS2","Counter-Strike 2","Counter Strike"]){for(let page=1;page<=5;page++){const u=new URL(`${GAMMA}/public-search`);u.searchParams.set("q",query);u.searchParams.set("limit_per_type","50");u.searchParams.set("page",String(page));u.searchParams.set("keep_closed_markets","0");u.searchParams.set("search_profiles","false");u.searchParams.set("search_tags","false");let d;try{d=await fetchJ(u.toString(),{timeout:10000},3)}catch{break}for(const e of d.events||[]){const s=String(e.slug||""),t=String(e.title||"").toLowerCase();if(s&&e.closed!==true&&(s.toLowerCase().startsWith("cs2-")||t.includes("counter strike")||t.includes("counter-strike")))found.set(s,e)}if(!(d.pagination||{}).hasMore)break}}return[...found.values()]}
+async function activeCS2(){
+  const found=new Map();
+
+  // Primary path: official Gamma events endpoint filtered directly by CS2 tag.
+  // This is more reliable than public-search for the dashboard.
+  for(const tagSlug of ["cs2","counter-strike-2","counter-strike"]){
+    for(let offset=0;offset<3000;offset+=500){
+      const u=new URL(`${GAMMA}/events`);
+      u.searchParams.set("tag_slug",tagSlug);
+      u.searchParams.set("active","true");
+      u.searchParams.set("closed","false");
+      u.searchParams.set("limit","500");
+      u.searchParams.set("offset",String(offset));
+      u.searchParams.set("order","start_date");
+      u.searchParams.set("ascending","true");
+
+      let rows;
+      try{
+        rows=await fetchJ(u.toString(),{timeout:12000},3);
+      }catch{
+        break;
+      }
+
+      if(!Array.isArray(rows)||!rows.length)break;
+
+      for(const e of rows){
+        const slug=String(e.slug||"");
+        if(!slug||e.closed===true)continue;
+        found.set(slug,e);
+      }
+
+      if(rows.length<500)break;
+      await new Promise(r=>setImmediate(r));
+    }
+
+    if(found.size)break;
+  }
+
+  // Fallback 1: active events, then filter by slug/title/embedded tags.
+  if(!found.size){
+    for(let offset=0;offset<5000;offset+=500){
+      const u=new URL(`${GAMMA}/events`);
+      u.searchParams.set("active","true");
+      u.searchParams.set("closed","false");
+      u.searchParams.set("limit","500");
+      u.searchParams.set("offset",String(offset));
+      u.searchParams.set("order","start_date");
+      u.searchParams.set("ascending","true");
+
+      let rows;
+      try{
+        rows=await fetchJ(u.toString(),{timeout:12000},3);
+      }catch{
+        break;
+      }
+
+      if(!Array.isArray(rows)||!rows.length)break;
+
+      for(const e of rows){
+        const slug=String(e.slug||"").toLowerCase();
+        const title=String(e.title||"").toLowerCase();
+        const tags=(e.tags||[]).map(t=>String(t.slug||t.label||"").toLowerCase());
+
+        const isCS2=
+          slug.startsWith("cs2-") ||
+          slug.includes("/cs2/") ||
+          title.includes("counter-strike") ||
+          title.includes("counter strike") ||
+          tags.some(t=>t==="cs2"||t.includes("counter-strike"));
+
+        if(isCS2&&e.closed!==true)found.set(String(e.slug||""),e);
+      }
+
+      if(rows.length<500)break;
+      await new Promise(r=>setImmediate(r));
+    }
+  }
+
+  // Fallback 2: original public-search route.
+  if(!found.size){
+    for(const query of ["CS2","Counter-Strike 2","Counter Strike"]){
+      for(let page=1;page<=5;page++){
+        const u=new URL(`${GAMMA}/public-search`);
+        u.searchParams.set("q",query);
+        u.searchParams.set("limit_per_type","50");
+        u.searchParams.set("page",String(page));
+        u.searchParams.set("keep_closed_markets","0");
+        u.searchParams.set("search_profiles","false");
+        u.searchParams.set("search_tags","false");
+
+        let d;
+        try{
+          d=await fetchJ(u.toString(),{timeout:10000},3);
+        }catch{
+          break;
+        }
+
+        for(const e of d.events||[]){
+          const slug=String(e.slug||"");
+          const title=String(e.title||"").toLowerCase();
+
+          if(
+            slug &&
+            e.closed!==true &&
+            (
+              slug.toLowerCase().startsWith("cs2-") ||
+              title.includes("counter strike") ||
+              title.includes("counter-strike")
+            )
+          ){
+            found.set(slug,e);
+          }
+        }
+
+        if(!(d.pagination||{}).hasMore)break;
+      }
+    }
+  }
+
+  console.log(`CS2 discovery: ${found.size} active events`);
+  return [...found.values()];
+}
+
 async function refreshActive(){const events=await activeCS2(),ts=now();db.exec("DELETE FROM active_games;DELETE FROM active_game_markets;");for(const e0 of events){let e=e0;if(!e.markets){try{e=await eventBySlug(e.slug)}catch{}}const key=String(e.id?`event:${e.id}`:`slug:${e.slug}`);db.prepare("INSERT OR REPLACE INTO active_games(game_key,event_id,event_slug,title,start_time,refreshed_at) VALUES(?,?,?,?,?,?)").run(key,String(e.id||""),String(e.slug||""),String(e.title||""),String(e.startDate||e.endDate||""),ts);for(const m of marketRows([e]))db.prepare("INSERT OR REPLACE INTO active_game_markets(game_key,condition_id,market_slug,market_title) VALUES(?,?,?,?)").run(key,m.condition_id,m.market_slug,m.market_title)}return events.length}
 
 function cleanupDatabase(){
@@ -379,6 +501,6 @@ dbBytes:(()=>{try{return fs.statSync(DB_PATH).size}catch{return 0}})(),
 auto:autoState
 });
 if(req.method==="GET"&&u.pathname==="/api/dashboard/auto")return json(res,200,{auto:autoState});if(req.method==="POST"&&u.pathname==="/api/track"){const b=await body(req),id=jid();setP(id,{status:"queued",message:"A iniciar..."});trackJob(id,b.input);return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/tracked")return json(res,200,{rows:db.prepare("SELECT slug,title,start_time,last_run_utc FROM tracked_games ORDER BY last_run_utc DESC").all()});if(req.method==="POST"&&u.pathname==="/api/dashboard/refresh"){const id=jid();setP(id,{status:"queued",message:"A iniciar..."});dashboardJob(id,"manual");return json(res,202,{job:id})}if(req.method==="GET"&&u.pathname==="/api/dashboard")return json(res,200,{rows:dashboardRows()});if(req.method==="GET"&&u.pathname.startsWith("/api/jobs/"))return json(res,200,progress.get(u.pathname.split("/").pop())||{status:"unknown"});let f=u.pathname==="/"?"index.html":u.pathname.replace(/^\/+/,"");const fp=path.join(pub,f);if(!fp.startsWith(pub)||!fs.existsSync(fp))return json(res,404,{error:"not found"});const ext=path.extname(fp),types={".html":"text/html; charset=utf-8",".css":"text/css; charset=utf-8",".js":"text/javascript; charset=utf-8"};res.writeHead(200,{"content-type":types[ext]||"application/octet-stream","cache-control":"no-store"});res.end(fs.readFileSync(fp))}catch(e){json(res,500,{error:String(e.message||e)})}}).listen(PORT,HOST,()=>{
-console.log(`\nCS2 Combo Tracker ONLINE v7 MEMORY SAFE: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos\n`);
+console.log(`\nCS2 Combo Tracker ONLINE v8 CS2 DISCOVERY: http://${HOST}:${PORT}\nDB: ${DB_PATH}\nDashboard automático: 10 em 10 minutos\n`);
 startDashboardAuto();
 });
